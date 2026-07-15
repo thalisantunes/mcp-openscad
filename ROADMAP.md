@@ -4,7 +4,7 @@
 
 ---
 
-## Estado atual — v0.2.0 ✅
+## Estado atual — v0.3.0 ✅
 
 | Ferramenta | Descrição |
 |---|---|
@@ -13,20 +13,27 @@
 | `export_3mf` | Exporta 3MF (formato moderno de impressão 3D) |
 | `export_dxf` | Exporta DXF para laser / CNC |
 | `export_svg` | Exporta SVG para laser / gravação |
-| `export_csg` | Exporta CSG (geometria sólida) |
-| `export_amf` | Exporta AMF (fabricação aditiva) |
+| `check_syntax` | Valida sintaxe SCAD sem renderizar (rápido) |
 | `generate_laser_part` | Gera 2D+3D inteligente para laser com finger joints, aberturas e layout automático |
 | `validate_laser_config` | Detecta problemas geométricos antes de cortar |
+| `generate_box` | Caixa retangular completa com tampa (snap/slide/none) e divisórias internas |
+| `generate_kerf_test` | Placa de calibração de kerf (pinos macho + fendas fêmea) |
+| `generate_finger_test` | Pente de teste de finger joints com múltiplos offsets |
+| `estimate_material_use` | Calcula área e aproveitamento da chapa |
+| `generate_3d_box` | Caixa sólida paramétrica com tampa snap-fit ou rosqueável |
+| `generate_bracket` | Suporte/mancal paramétrico (L, U, flat) com furos de montagem |
+| `generate_enclosure` | Gabinete eletrônico com catálogo de conectores e pilares PCB |
+| `validate_printability` | Valida imprimibilidade FDM/resina (paredes, overhang, camadas) |
+
+**Testes:** 84 testes · 90% cobertura · CI GitHub Actions
 
 ---
 
-## v0.3 — Laser Cutting Completo
-> _Foco: tornar o gerador de peças a laser robusto e profissional_
+## v0.3.x — Laser Cutting Completo (Pendente)
 
 ### v0.3.1 — Tipos de junção adicionais
-- [ ] **T-slot joint** — encaixe em T com porca de martelo (muito usado em estruturas)
+- [ ] **T-slot joint** — encaixe em T com porca de martelo
 - [ ] **Lap joint** — meia-madeira (overlap de 50% da espessura)
-- [ ] **Puzzle joint** — encaixe curvilíneo (bom para painéis curvos)
 - [ ] **Dado joint** — fenda rebaixada (para prateleiras dentro de caixas)
 - [ ] Parâmetro `joint_type` no `generate_laser_part`
 
@@ -34,122 +41,92 @@
 - [ ] **Painéis inclinados** com ângulo configurável (`roof_angle`, `pitch`)
 - [ ] **Butt-joint no cumeeira** (painel longo/curto automático)
 - [ ] Suporte a paredes com topo triangular (gável/frontão)
-- [ ] Geração de slots nos painéis de telhado alinhados com a rampa
-
-### v0.3.3 — Gerador de caixas avançado
-- [ ] `generate_box` — caixa retangular completa com tampa encaixável
-- [ ] Opções de tampa: **dobradiça laser** (living hinge), **parafuso**, **encaixe por pressão**
-- [ ] Caixas com divisórias internas configuráveis
-- [ ] Suporte a pés/niveladores (pequenos dentes de apoio na base)
-
-### v0.3.4 — Ferramentas de qualidade de corte
-- [ ] `generate_kerf_test` — gera placa de teste para calibrar o kerf da sua máquina
-- [ ] `generate_finger_test` — gera pente de teste de encaixes (vários offsets de 0.1 em 0.1mm)
-- [ ] `estimate_material_use` — calcula área total usada e retorna % de aproveitamento da chapa
-- [ ] Detecção de peças muito pequenas que podem cair durante o corte
 
 ### v0.3.5 — Engravings e decorações 2D
 - [ ] Suporte a **texto gravado** (engraving) com fonte configurável
 - [ ] **Living hinge** — padrão de corte que deixa o MDF/acrílico flexível
 - [ ] **Dogbone corners** — cantos com círculo para compensar fresa de CNC
-- [ ] Suporte a importar SVG externo como decoração
 
 ---
 
-## v0.4 — Impressão 3D Inteligente
-> _Foco: geração paramétrica para impressão 3D com consciência de fabricação_
+## v0.4 — Impressão 3D Inteligente (Parcialmente implementado)
 
-### v0.4.1 — Gerador de objetos 3D paramétricos
-- [ ] `generate_3d_box` — caixa sólida com tampa rosqueável ou por encaixe
-- [ ] `generate_bracket` — suportes/mancais com furos de montagem configuráveis
-- [ ] `generate_enclosure` — gabinete eletrônico com furações para conectores, display e botões
-- [ ] `generate_thread` — rosca ISO métrica (M3–M20) paramétrica para porcas e parafusos impressos
-
-### v0.4.2 — Validação para impressão 3D
-- [ ] `validate_printability` — verifica:
-  - [ ] Paredes muito finas (< 1.2mm para FDM padrão)
-  - [ ] Overhangs > 45° sem suporte
-  - [ ] Peças isoladas (não-manifold)
-  - [ ] Dimensões mínimas de detalhes
-  - [ ] Espessura de fundo/topo em múltiplos de altura de camada
-- [ ] `suggest_orientation` — sugere a melhor orientação de impressão para minimizar suportes
+### v0.4.2 — Validação avançada para impressão 3D ✅ (parcial)
+- [x] `validate_printability` — verifica paredes, overhang, layer height, proporções
+- [ ] Verificação de peças não-manifold
+- [ ] Verificação de detalhes menores que resolução mínima
+- [ ] `suggest_orientation` — sugere a melhor orientação de impressão
 
 ### v0.4.3 — Configuração por perfil de impressora
-- [ ] Perfis pré-definidos: **FDM padrão** (0.4mm nozzle, 0.2mm layer), **Resina**, **FDM fino** (0.2mm nozzle)
-- [ ] `tolerance` automático por perfil (folga para peças encaixáveis)
-- [ ] Geração de **textura de superfície** (grelha, honeycomb) para economia de material
+- [ ] Perfis: FDM padrão, FDM fino, Resina (parâmetros automáticos)
+- [ ] `tolerance` automático por perfil
+- [ ] Geração de **textura de superfície** (grelha, honeycomb)
 
-### v0.4.4 — Placas de teste e calibração
-- [ ] `generate_tolerance_test` — peças macho/fêmea com escala de tolerâncias (0.1mm a 0.5mm)
+### v0.4.4 — Placas de teste 3D
+- [ ] `generate_tolerance_test` — peças macho/fêmea com escala de tolerâncias
 - [ ] `generate_bed_level_test` — padrão de nivelamento de cama
 - [ ] `generate_retraction_test` — torre de teste de retração
 
 ### v0.4.5 — Multi-peças e assemblies
-- [ ] `generate_assembly` — projetos com múltiplas peças encaixáveis (impressas + laser)
-- [ ] Exportação individual de cada peça com nome descritivo
+- [ ] `generate_assembly` — projetos com múltiplas peças encaixáveis
+- [ ] Exportação individual por peça com nome descritivo
 - [ ] **BOM (Bill of Materials)** automático em Markdown
 
 ---
 
 ## v0.5 — CNC e Fabricação Híbrida
-> _Foco: suporte a fresamento CNC e projetos que combinam múltiplos processos_
 
 ### v0.5.1 — CNC Routing
-- [ ] `generate_cnc_toolpath_hints` — sugere passadas e profundidades de corte por material
+- [ ] `generate_cnc_toolpath_hints` — sugestões de passadas e profundidades por material
 - [ ] **Dogbone automático** em todos os cantos internos
 - [ ] **Tabs de fixação** (pontes que mantêm a peça presa durante o corte)
 - [ ] Geração de arquivo com marcações de zero-peça
 
 ### v0.5.2 — Projetos híbridos
-- [ ] Projetos que combinam peças **laser (2D) + impressão 3D** em uma única assembly
-- [ ] Geração separada por processo: "peças para laser", "peças para impressão"
-- [ ] Conectores paramétricos laser/impressão (encaixe padrão)
+- [ ] Projetos que combinam peças **laser (2D) + impressão 3D** em uma assembly
+- [ ] Geração separada por processo
 
 ### v0.5.3 — Exportação profissional
 - [ ] DXF com **camadas separadas** (corte vs. gravação vs. marcação)
 - [ ] PDF de montagem com dimensões anotadas
 - [ ] **STEP** para compatibilidade com CAD profissional (FreeCAD, Fusion360)
-- [ ] G-Code básico para pequenas fresadoras
 
 ---
 
 ## v0.6 — Infraestrutura e Developer Experience
-> _Foco: tornar o servidor robusto, extensível e fácil de usar_
 
 ### v0.6.1 — Melhorias no servidor MCP
-- [ ] Cache de geometrias compiladas (CSG tree) para re-exports rápidos
-- [ ] Suporte a **OPENSCADPATH** para usar bibliotecas externas (BOSL2, OpenSCAD std)
+- [ ] Cache de geometrias compiladas para re-exports rápidos
+- [ ] Suporte a **OPENSCADPATH** para bibliotecas externas (BOSL2)
 - [ ] Opções avançadas de câmera: ângulo, zoom, perspectiva vs. ortográfica
-- [ ] Streaming de preview PNG durante renderizações longas
 
 ### v0.6.2 — Biblioteca de componentes
 - [ ] Biblioteca interna de módulos reutilizáveis (slots, tabs, hinges, threads)
-- [ ] Módulos acessíveis via include automático nos arquivos gerados
-- [ ] Compatibilidade com **BOSL2** (biblioteca OpenSCAD mais popular)
+- [ ] Compatibilidade com **BOSL2**
 - [ ] Galeria de exemplos renderizados no README
 
-### v0.6.3 — Observabilidade e diagnóstico
-- [ ] Parsing aprimorado dos warnings/erros do OpenSCAD (mensagens amigáveis para LLMs)
-- [ ] `check_syntax` — validação de sintaxe sem renderizar (rápido)
-- [ ] Logs estruturados (JSON) para integração com ferramentas de monitoramento
+### v0.6.3 — Observabilidade
+- [x] `check_syntax` — validação rápida de sintaxe
+- [ ] Parsing aprimorado dos warnings/erros do OpenSCAD
+- [ ] Logs estruturados (JSON)
 
 ### v0.6.4 — Testes e CI
-- [x] Testes unitários básicos
-- [ ] Testes de integração com OpenSCAD real (render e valida output)
+- [x] Testes unitários — 84 testes
+- [x] Testes de integração com OpenSCAD real
+- [x] Coverage > 80% (atual: 90%)
+- [x] GitHub Actions: lint + test
 - [ ] Testes de regressão visual (compara PNG com baseline)
-- [ ] Coverage > 80%
-- [ ] GitHub Actions: lint + test + render de todos os exemplos
+- [ ] Render de todos os exemplos no CI
 
 ---
 
 ## v1.0 — Release Estável
 
-- [ ] Documentação completa de todas as ferramentas com exemplos
+- [ ] Documentação completa de todas as 16 ferramentas com exemplos
 - [ ] Galeria de projetos feitos com o MCP (casa, caixa, gabinete, suporte...)
 - [ ] Schema JSON validado para todos os configs
 - [ ] Guia de contribuição claro
 - [ ] Publicação no **PyPI** como pacote instalável
-- [ ] Suporte a múltiplas instâncias do OpenSCAD em paralelo (fila de renderização)
 - [ ] Plugin Antigravity oficial — integração nativa com o AGY CLI
 
 ---
@@ -161,33 +138,8 @@
 | Integração com Printables/MakerWorld | Upload automático de STL gerado |
 | Slicer hints (PrusaSlicer, Cura) | Enviar STL + perfil de impressão direto para o slicer |
 | AR preview via WebXR | Ver o objeto no espaço real antes de imprimir |
-| Suporte a STEP → SCAD reverso | Importar peça existente e parametrizá-la |
-| Simulação de montagem | Verificar se as peças encaixam antes de cortar/imprimir |
+| STEP → SCAD reverso | Importar peça existente e parametrizá-la |
 | Estimativa de custo | Calcular custo por material, tempo de corte/impressão |
-
----
-
-## Prioridade de Implementação
-
-```
-Alta prioridade (próximas sprints):
-  v0.3.2  Telhado/painéis inclinados      → completa a casinha atual
-  v0.3.3  generate_box                    → caso de uso mais comum em laser
-  v0.3.4  generate_kerf_test              → necessidade imediata do usuário
-  v0.4.1  Geradores 3D paramétricos       → expande para impressão 3D
-  v0.4.2  validate_printability           → evita impressões falhas
-
-Média prioridade:
-  v0.3.1  Tipos de junção extras          → qualidade profissional
-  v0.4.3  Perfis de impressora            → personalização real
-  v0.5.1  CNC routing                     → novo processo de fabricação
-  v0.6.1  Melhorias servidor              → performance e UX
-
-Baixa prioridade (futuro):
-  v0.5.x  Exportação profissional
-  v0.6.x  Infraestrutura avançada
-  v1.0    Release estável
-```
 
 ---
 
@@ -197,8 +149,8 @@ Baixa prioridade (futuro):
 |---|---|---|
 | v0.1.0 | ✅ Released | Exportação básica (PNG, STL, DXF, SVG...) |
 | v0.2.0 | ✅ Released | `generate_laser_part` + `validate_laser_config` |
-| v0.3.x | 🔜 Próximo | Laser cutting profissional |
-| v0.4.x | 📋 Planejado | Impressão 3D inteligente |
+| v0.3.0 | ✅ Released | `generate_box`, `generate_kerf_test`, `generate_finger_test`, `estimate_material_use`, `check_syntax`, `generate_3d_box`, `generate_bracket`, `generate_enclosure`, `validate_printability` |
+| v0.4.x | 🔜 Próximo | Impressão 3D avançada: `suggest_orientation`, perfis, `generate_assembly` |
 | v0.5.x | 📋 Planejado | CNC + fabricação híbrida |
-| v0.6.x | 📋 Planejado | Infraestrutura e DX |
-| v1.0.0 | 🏁 Meta | Produto estável e publicado |
+| v0.6.x | 📋 Planejado | Infraestrutura, BOSL2, cache, logs |
+| v1.0.0 | 🏁 Meta | Produto estável e publicado no PyPI |

@@ -1,4 +1,4 @@
-name: Test
+name: Test & Coverage
 
 on:
   push:
@@ -12,23 +12,31 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: "3.12"
-        
+
     - name: Install OpenSCAD
       run: |
         sudo apt-get update
-        sudo apt-get install -y openscad
-        
+        sudo apt-get install -y openscad xvfb
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install -r requirements-dev.txt
-        
-    - name: Run tests with pytest
+
+    - name: Validate import
+      run: python -c "import server; print('Import OK')"
+
+    - name: Run tests with coverage
       run: |
-        pytest --cov=server --cov-fail-under=80 tests/
+        pytest --cov=server --cov-report=term-missing --cov-fail-under=85 -v tests/
+
+    - name: Check coverage summary
+      run: |
+        echo "Coverage target: >= 85%"
+        pytest --cov=server --cov-report=xml tests/ -q

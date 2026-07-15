@@ -1,94 +1,152 @@
-# MCP OpenSCAD Server
+# mcp-openscad
 
-An MCP (Model Context Protocol) server for interacting with OpenSCAD. This server enables LLMs and Agents to autonomously generate, render, and export parametric CAD designs for **3D printing**, **laser cutting**, and **CNC machining**.
+> Servidor MCP (Model Context Protocol) que permite agentes de IA interagir com o OpenSCAD para gerar, renderizar e exportar designs CAD paramétricos para fabricação digital — laser cutting, impressão 3D e CNC.
 
-> See [ROADMAP.md](./ROADMAP.md) for the full development plan.
+## Versão atual: v0.3.0
 
----
+### Ferramentas disponíveis (16)
 
-## Features
-
-### Export Tools
-| Tool | Description |
+#### Exportação Básica
+| Ferramenta | Descrição |
 |---|---|
-| `render_to_png` | Render any OpenSCAD script to a PNG preview image |
-| `export_stl` | Export 3D designs to STL (for 3D printing) |
-| `export_3mf` | Export 3D designs to 3MF (modern 3D printing format) |
-| `export_dxf` | Export 2D designs to DXF (for laser cutting / CNC) |
-| `export_svg` | Export 2D designs to SVG (for laser engraving / cutting) |
-| `export_csg` | Export designs to CSG (Constructive Solid Geometry) |
-| `export_amf` | Export designs to AMF (Additive Manufacturing Format) |
+| `render_to_png` | Preview PNG de qualquer código SCAD |
+| `export_stl` | Exporta STL para impressão 3D |
+| `export_3mf` | Exporta 3MF (formato moderno de impressão 3D) |
+| `export_dxf` | Exporta DXF para laser / CNC |
+| `export_svg` | Exporta SVG para laser / gravação |
+| `check_syntax` | Valida sintaxe SCAD sem renderizar (rápido) |
 
-### Intelligent Generation Tools (v0.2+)
+#### Corte a Laser
+| Ferramenta | Descrição |
+|---|---|
+| `generate_laser_part` | Gera 2D+3D com finger joints, aberturas (porta/janela), layout automático → SCAD+SVG+DXF+PNG |
+| `validate_laser_config` | Detecta problemas geométricos antes de cortar |
+| `generate_box` | Caixa retangular com tampa (snap/slide/none) e divisórias internas |
+| `generate_kerf_test` | Placa de calibração de kerf — pinos macho + fendas fêmea com kerf variado |
+| `generate_finger_test` | Pente de teste de finger joints com múltiplos offsets |
+| `estimate_material_use` | Calcula área total e aproveitamento da chapa |
 
-#### `generate_laser_part`
-Generates a complete laser cutting project from a simple JSON config — no OpenSCAD knowledge needed.
+#### Impressão 3D
+| Ferramenta | Descrição |
+|---|---|
+| `generate_3d_box` | Caixa sólida paramétrica com tampa snap-fit ou rosqueável |
+| `generate_bracket` | Suporte/mancal paramétrico (tipo L, U ou flat) com furos de montagem |
+| `generate_enclosure` | Gabinete eletrônico com catálogo de conectores e pilares para PCB |
+| `validate_printability` | Valida imprimibilidade: paredes, overhang, layer height, proporções |
 
-- **Smart finger joints** that automatically skip teeth under openings (door/windows), preventing floating pieces
-- **Automatic 2D layout** of all panels with proper spacing — no manual positioning
-- **Single source of truth** — one `.scad` file with `RENDER_MODE = "2d"` or `"3d"` toggle
-- Exports `.scad` + `.svg` + `.dxf` + preview PNG in one call
-
-```json
-{
-  "material_thickness": 3,
-  "kerf": 0.2,
-  "width": 100,
-  "depth": 100,
-  "height": 80,
-  "fingers": 5,
-  "openings": [
-    { "wall": "front", "shape": "rect",   "x": 35, "y": 0,  "w": 30, "h": 45 },
-    { "wall": "front", "shape": "circle", "cx": 50, "cy": 62, "d": 20 },
-    { "wall": "back",  "shape": "circle", "cx": 50, "cy": 40, "d": 30 }
-  ]
-}
-```
-
-#### `validate_laser_config`
-Pre-flight geometry validation **before** generating any files. Detects:
-- Teeth that would fall under openings (causing floating pieces on the laser cutter)
-- Openings exceeding panel dimensions
-- Other geometric problems with exact location reporting
-
----
-
-## Requirements
-
-- OpenSCAD installed and available in the system PATH (`openscad`)
-- Python 3.10+
-- The `mcp` Python SDK
-
-## Installation
+## Instalação
 
 ```bash
-python3 -m venv venv
+git clone https://github.com/thalisantunes/mcp-openscad
+cd mcp-openscad
+python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Running the Server
+Requisito externo: [OpenSCAD](https://openscad.org/downloads.html) deve estar instalado e no `PATH`.
 
-Configure in your Agent's `mcp_config.json`:
+## Uso
+
+```bash
+source venv/bin/activate
+python server.py
+```
+
+### Configuração no Claude Desktop / Antigravity
 
 ```json
 {
   "mcpServers": {
     "openscad": {
-      "command": "/path/to/mcp-openscad/venv/bin/python3",
+      "command": "/path/to/venv/bin/python",
       "args": ["/path/to/mcp-openscad/server.py"]
     }
   }
 }
 ```
 
----
+## Exemplos rápidos
+
+### Caixa para laser
+```json
+{
+  "tool": "generate_box",
+  "config": {
+    "width": 150, "depth": 100, "height": 60,
+    "material_thickness": 3, "kerf": 0.2,
+    "fingers": 7, "lid_type": "snap", "dividers_x": 2
+  },
+  "output_dir": "/tmp/minha_caixa",
+  "project_name": "caixa_ferramentas"
+}
+```
+
+### Teste de kerf
+```json
+{
+  "tool": "generate_kerf_test",
+  "config": { "material_thickness": 3, "kerf_min": 0.1, "kerf_max": 0.4, "kerf_step": 0.05 },
+  "output_dir": "/tmp", "project_name": "kerf_mdf3"
+}
+```
+
+### Gabinete eletrônico
+```json
+{
+  "tool": "generate_enclosure",
+  "config": {
+    "width": 120, "depth": 80, "height": 40,
+    "wall": 2.5, "lid_type": "snap",
+    "connectors": [
+      {"wall": "front", "type": "usb_c", "x": 30, "y": 12},
+      {"wall": "back",  "type": "barrel_jack", "x": 20, "y": 15}
+    ],
+    "pcb_standoffs": [{"x": 5,"y":5},{"x":110,"y":5},{"x":5,"y":70},{"x":110,"y":70}]
+  },
+  "output_dir": "/tmp/gabinete", "project_name": "esp32_case"
+}
+```
+
+### Validar antes de imprimir
+```json
+{
+  "tool": "validate_printability",
+  "config": {
+    "wall_thickness": 1.5, "bottom_thickness": 0.6,
+    "height": 60, "width": 50, "depth": 40,
+    "overhang_angle": 50, "layer_height": 0.2,
+    "profile": "fdm_standard"
+  }
+}
+```
+
+## Desenvolvimento
+
+```bash
+# Rodar testes
+source venv/bin/activate
+python -m pytest tests/ -v
+
+# Cobertura
+python -m pytest tests/ --cov=server --cov-report=term-missing
+```
+
+Cobertura atual: **90%** — 84 testes.
 
 ## Roadmap
 
-See [ROADMAP.md](./ROADMAP.md) for the full plan. Highlights:
+Ver [ROADMAP.md](./ROADMAP.md) para o plano completo.
 
-- **v0.3** — Laser: roof panels, box generator, kerf test, living hinges
-- **v0.4** — 3D Printing: parametric generators, printability validation, printer profiles
-- **v0.5** — CNC routing, hybrid laser+3D projects, professional exports (STEP, G-Code)
-- **v1.0** — Stable release, PyPI package, full documentation
+## Calibração conhecida
+
+| Material | Kerf | fit_allowance | Slot (t=3mm) |
+|---|---|---|---|
+| MDF 3mm | 0.2mm | 0.2mm | 2.8mm |
+| Acrílico 3mm | 0.15mm | — | — |
+
+## Stack técnico
+
+- Python 3.10+ · `mcp` SDK · OpenSCAD CLI
+- Testes: `pytest` + `pytest-asyncio` + `pytest-cov`
+- CI: GitHub Actions
