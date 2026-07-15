@@ -21,8 +21,14 @@ def run_openscad(scad_code: str, output_ext: str, export_args=None):
     
     cmd = ["openscad", "-o", out_path] + export_args + [scad_path]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
         return out_path, result.stdout
+    except subprocess.TimeoutExpired as e:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        if os.path.exists(scad_path):
+            os.remove(scad_path)
+        raise RuntimeError("OpenSCAD Error: Execution timed out after 60 seconds.")
     except subprocess.CalledProcessError as e:
         if os.path.exists(out_path):
             os.remove(out_path)

@@ -13,7 +13,7 @@
 - [ ] Mais opções de renderização (cores, ângulos de câmera, resolução).
 
 ## Fase 3: Confiabilidade e Segurança
-- [ ] Timeout nas chamadas de execução do OpenSCAD (para prevenir scripts que travam a execução).
+- [x] Timeout nas chamadas de execução do OpenSCAD (para prevenir scripts que travam a execução).
 - [ ] Tratamento de erros e parsing aprimorado das mensagens do OpenSCAD para fácil correção pelo modelo.
 - [ ] Criação de testes automatizados unitários/integração.
 
