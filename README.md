@@ -12,6 +12,8 @@ An MCP (Model Context Protocol) server for interacting with OpenSCAD. This serve
 - **export_dxf**: Export 2D OpenSCAD designs to DXF files (for Laser Cutting / CNC).
 - **export_svg**: Export 2D OpenSCAD designs to SVG files (for Laser Engraving / Cutting).
 
+*Note: All tools support an optional `variables` argument for passing parametric variables (`-D name=value`) to OpenSCAD.*
+
 ## Requirements
 
 - OpenSCAD installed and available in the system PATH (`openscad`).

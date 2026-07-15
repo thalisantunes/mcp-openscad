@@ -8,7 +8,7 @@
 - [x] Suporte a exportação AMF (`export_amf`)
 
 ## Fase 2: Parametrização e Configurações
-- [ ] Suporte a passagem de variáveis (`-D var=value`) para personalizar os modelos.
+- [x] Suporte a passagem de variáveis (`-D var=value`) para personalizar os modelos.
 - [ ] Permitir uso de bibliotecas de terceiros ou definição de `OPENSCADPATH`.
 - [ ] Mais opções de renderização (cores, ângulos de câmera, resolução).
 

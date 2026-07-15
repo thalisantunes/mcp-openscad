@@ -43,6 +43,7 @@ async def handle_list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "variables": {"type": "object", "description": "Optional dictionary of variables to pass to OpenSCAD (-D name=value)"},
                     "scad_code": {"type": "string", "description": "The OpenSCAD source code"},
                 },
                 "required": ["scad_code"]
@@ -54,6 +55,7 @@ async def handle_list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "variables": {"type": "object", "description": "Optional dictionary of variables to pass to OpenSCAD (-D name=value)"},
                     "scad_code": {"type": "string", "description": "The OpenSCAD source code"},
                     "output_path": {"type": "string", "description": "Absolute path to save the .stl file"}
                 },
@@ -66,6 +68,7 @@ async def handle_list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "variables": {"type": "object", "description": "Optional dictionary of variables to pass to OpenSCAD (-D name=value)"},
                     "scad_code": {"type": "string", "description": "The OpenSCAD source code"},
                     "output_path": {"type": "string", "description": "Absolute path to save the .3mf file"}
                 },
@@ -78,6 +81,7 @@ async def handle_list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "variables": {"type": "object", "description": "Optional dictionary of variables to pass to OpenSCAD (-D name=value)"},
                     "scad_code": {"type": "string", "description": "The OpenSCAD source code"},
                     "output_path": {"type": "string", "description": "Absolute path to save the .csg file"}
                 },
@@ -90,6 +94,7 @@ async def handle_list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "variables": {"type": "object", "description": "Optional dictionary of variables to pass to OpenSCAD (-D name=value)"},
                     "scad_code": {"type": "string", "description": "The OpenSCAD source code"},
                     "output_path": {"type": "string", "description": "Absolute path to save the .amf file"}
                 },
@@ -102,6 +107,7 @@ async def handle_list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "variables": {"type": "object", "description": "Optional dictionary of variables to pass to OpenSCAD (-D name=value)"},
                     "scad_code": {"type": "string", "description": "The OpenSCAD source code (must be 2D)"},
                     "output_path": {"type": "string", "description": "Absolute path to save the .dxf file"}
                 },
@@ -114,6 +120,7 @@ async def handle_list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "variables": {"type": "object", "description": "Optional dictionary of variables to pass to OpenSCAD (-D name=value)"},
                     "scad_code": {"type": "string", "description": "The OpenSCAD source code (must be 2D)"},
                     "output_path": {"type": "string", "description": "Absolute path to save the .svg file"}
                 },
@@ -131,9 +138,19 @@ async def handle_call_tool(
     
     scad_code = arguments["scad_code"]
     
+    variables = arguments.get("variables", {})
+    extra_args = []
+    for k, v in variables.items():
+        if isinstance(v, str):
+            extra_args.extend(["-D", f'{k}="{v}"'])
+        elif isinstance(v, bool):
+            extra_args.extend(["-D", f'{k}={"true" if v else "false"}'])
+        else:
+            extra_args.extend(["-D", f'{k}={v}'])
+    
     if name == "render_to_png":
         try:
-            out_path, stdout = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
+            out_path, stdout = run_openscad(scad_code, "png", ["--autocenter", "--viewall"] + extra_args)
             with open(out_path, "rb") as f:
                 import base64
                 img_data = base64.b64encode(f.read()).decode("utf-8")
@@ -153,7 +170,7 @@ async def handle_call_tool(
         ext = name.split("_")[1] # stl, dxf, or svg
         
         try:
-            out_path, stdout = run_openscad(scad_code, ext)
+            out_path, stdout = run_openscad(scad_code, ext, extra_args)
             # move from tmp to output_path
             import shutil
             shutil.move(out_path, output_path)
