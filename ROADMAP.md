@@ -15,8 +15,8 @@
 ## Fase 3: Confiabilidade e Segurança
 - [x] Timeout nas chamadas de execução do OpenSCAD (para prevenir scripts que travam a execução).
 - [ ] Tratamento de erros e parsing aprimorado das mensagens do OpenSCAD para fácil correção pelo modelo.
-- [ ] Criação de testes automatizados unitários/integração.
+- [x] Criação de testes automatizados unitários/integração.
 
 ## Fase 4: Qualidade de Vida (QoL)
 - [ ] Checagem de sintaxe antes de iniciar a renderização completa.
-- [ ] Pipeline CI/CD básico no repositório.
+- [x] Pipeline CI/CD básico no repositório.
