@@ -460,7 +460,7 @@ def test_generate_enclosure_connectors():
         ]
     }
     scad = server.generate_enclosure_scad(cfg)
-    assert "square" in scad  # cutouts geram squares
+    assert "cube" in scad  # cutouts geram cubes para subtração 3D
 
 
 def test_generate_enclosure_custom_connector():
@@ -782,3 +782,311 @@ def test_openscad_renders_kerf_test_svg():
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 100
     os.remove(out_path)
+
+
+def test_openscad_renders_enclosure():
+    """Integração: gera gabinete e renderiza STL."""
+    cfg = {
+        "width": 100, "depth": 60, "height": 30, "wall": 2.5,
+        "connectors": [{"wall": "front", "type": "usb_c", "x": 20, "y": 8}],
+        "pcb_standoffs": [{"x": 10, "y": 10}, {"x": 90, "y": 50}]
+    }
+    scad = server.generate_enclosure_scad(cfg)
+    out_path, _ = server.run_openscad(scad, "stl")
+    assert os.path.exists(out_path)
+    assert os.path.getsize(out_path) > 100
+    os.remove(out_path)
+
+
+def test_openscad_renders_laser_2d():
+    """Integração: gera laser_part e exporta SVG 2D."""
+    cfg = {"width": 80, "depth": 60, "height": 40}
+    scad = server.generate_laser_scad(cfg)
+    scad_2d = scad.replace('RENDER_MODE = "3d"', 'RENDER_MODE = "2d"')
+    out_path, _ = server.run_openscad(scad_2d, "svg")
+    assert os.path.exists(out_path)
+    assert os.path.getsize(out_path) > 100
+    os.remove(out_path)
+
+
+def test_openscad_renders_finger_test():
+    """Integração: gera finger test e exporta SVG."""
+    cfg = {"material_thickness": 3, "offset_min": 0.0, "offset_max": 0.1, "offset_step": 0.1}
+    scad = server.generate_finger_test_scad(cfg)
+    out_path, _ = server.run_openscad(scad, "svg")
+    assert os.path.exists(out_path)
+    os.remove(out_path)
+
+
+def test_openscad_renders_3d_box_with_lid():
+    """Integração: gera caixa 3D com tampa snap e renderiza STL."""
+    cfg = {"width": 60, "depth": 40, "height": 30, "lid_type": "snap"}
+    scad = server.generate_3d_box_scad(cfg)
+    out_path, _ = server.run_openscad(scad, "stl")
+    assert os.path.exists(out_path)
+    assert os.path.getsize(out_path) > 100
+    os.remove(out_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Edge cases: input validation guards
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_kerf_test_step_zero():
+    """Guard: kerf_step=0 deve usar fallback em vez de loop infinito."""
+    cfg = {"material_thickness": 3, "kerf_min": 0.1, "kerf_max": 0.3, "kerf_step": 0}
+    scad = server.generate_kerf_test_scad(cfg)
+    assert "square" in scad  # Deve gerar SCAD normalmente
+
+
+def test_kerf_test_step_negative():
+    """Guard: kerf_step negativo deve usar fallback."""
+    cfg = {"material_thickness": 3, "kerf_min": 0.1, "kerf_max": 0.3, "kerf_step": -0.1}
+    scad = server.generate_kerf_test_scad(cfg)
+    assert "square" in scad
+
+
+def test_finger_test_step_zero():
+    """Guard: offset_step=0 deve usar fallback em vez de loop infinito."""
+    cfg = {"material_thickness": 3, "offset_min": 0.0, "offset_max": 0.2, "offset_step": 0}
+    scad = server.generate_finger_test_scad(cfg)
+    assert "square" in scad
+
+
+def test_finger_test_step_negative():
+    """Guard: offset_step negativo deve usar fallback."""
+    cfg = {"material_thickness": 3, "offset_min": 0.0, "offset_max": 0.2, "offset_step": -0.1}
+    scad = server.generate_finger_test_scad(cfg)
+    assert "square" in scad
+
+
+def test_laser_scad_fingers_zero():
+    """Guard: fingers=0 não deve causar divisão por zero."""
+    cfg = {"width": 100, "depth": 80, "height": 50, "fingers": 0}
+    scad = server.generate_laser_scad(cfg)
+    assert "module front_wall" in scad
+
+
+def test_laser_scad_fingers_one():
+    """Edge: fingers=1 deve funcionar."""
+    cfg = {"width": 100, "depth": 80, "height": 50, "fingers": 1}
+    scad = server.generate_laser_scad(cfg)
+    assert "module front_wall" in scad
+
+
+def test_box_scad_fingers_zero():
+    """Guard: fingers=0 não deve causar divisão por zero no generate_box."""
+    cfg = {"width": 100, "depth": 80, "height": 50, "fingers": 0}
+    scad = server.generate_box_scad(cfg)
+    assert "module box_floor" in scad
+
+
+def test_box_scad_even_fingers_corrected():
+    """Verify: even fingers auto-corrected to odd in generate_box_scad."""
+    cfg = {"width": 100, "depth": 80, "height": 50, "fingers": 4}
+    scad = server.generate_box_scad(cfg)
+    assert "module box_floor" in scad  # Should generate successfully
+
+
+def test_kerf_exceeds_thickness():
+    """Guard: kerf >= material_thickness deve ser clamped."""
+    cfg = {"width": 100, "depth": 80, "height": 50, "material_thickness": 3, "kerf": 5}
+    scad = server.generate_laser_scad(cfg)
+    assert "slot" in scad  # Deve gerar código válido
+
+
+def test_box_kerf_exceeds_thickness():
+    """Guard: kerf >= material_thickness em generate_box."""
+    cfg = {"width": 100, "depth": 80, "height": 50, "material_thickness": 3, "kerf": 4}
+    scad = server.generate_box_scad(cfg)
+    assert "module box_floor" in scad
+
+
+def test_box_scad_with_dividers_x():
+    """Verifica que divisórias X são geradas no SCAD."""
+    cfg = {"width": 100, "depth": 80, "height": 50, "dividers_x": 2}
+    scad = server.generate_box_scad(cfg)
+    assert "Divisória X" in scad or "divid" in scad.lower()
+
+
+def test_box_scad_with_dividers_y():
+    """Verifica que divisórias Y são geradas no SCAD."""
+    cfg = {"width": 100, "depth": 80, "height": 50, "dividers_y": 1}
+    scad = server.generate_box_scad(cfg)
+    assert "Divisória Y" in scad or "divid" in scad.lower()
+
+
+def test_box_scad_negative_dividers_clamped():
+    """Guard: divisórias negativas são clamped a 0."""
+    cfg = {"width": 100, "depth": 80, "height": 50, "dividers_x": -3}
+    scad = server.generate_box_scad(cfg)
+    assert "module box_floor" in scad
+    # Não deve gerar divisórias
+    assert "Divisória" not in scad
+
+
+def test_finger_test_finger_count_zero():
+    """Guard: finger_count=0 não causa divisão por zero."""
+    cfg = {"material_thickness": 3, "finger_count": 0}
+    scad = server.generate_finger_test_scad(cfg)
+    assert "square" in scad
+
+
+def test_validate_box_config_thick_material():
+    """Warning: material muito grosso em relação às dimensões."""
+    cfg = {"width": 20, "depth": 20, "height": 20, "material_thickness": 8}
+    warns = server.validate_box_config(cfg)
+    assert any("Espessura" in w or "grande" in w for w in warns)
+
+
+def test_validate_box_config_thin_fingers():
+    """Warning: dentes muito finos."""
+    cfg = {"width": 20, "depth": 80, "height": 50, "fingers": 15, "material_thickness": 3}
+    warns = server.validate_box_config(cfg)
+    assert any("finos" in w for w in warns)
+
+
+def test_validate_printability_small_dimension():
+    """Warning: dimensão mínima < 5mm."""
+    cfg = {
+        "wall_thickness": 1.0, "bottom_thickness": 1.0,
+        "height": 3, "width": 3, "depth": 3,
+        "profile": "fdm_standard"
+    }
+    r = server.validate_printability(cfg)
+    assert any("pequena" in w for w in r["warnings"])
+
+
+def test_validate_printability_unknown_profile():
+    """Fallback: perfil desconhecido usa fdm_standard."""
+    cfg = {
+        "wall_thickness": 2.0, "bottom_thickness": 2.0,
+        "height": 40, "width": 80, "depth": 60,
+        "profile": "nonexistent_profile"
+    }
+    r = server.validate_printability(cfg)
+    assert r["printable"]  # Should use fdm_standard and pass
+
+
+def test_opening_unknown_shape():
+    """Edge: abertura com shape desconhecido deve ser ignorada."""
+    cfg = {
+        "width": 100, "depth": 80, "height": 50,
+        "openings": [{"wall": "front", "shape": "hexagon", "x": 30, "y": 10}]
+    }
+    scad = server.generate_laser_scad(cfg)
+    assert "module front_wall" in scad
+
+
+def test_empty_config_laser():
+    """Edge: config vazio deve usar defaults."""
+    scad = server.generate_laser_scad({})
+    assert "module front_wall" in scad
+
+
+def test_empty_config_box():
+    """Edge: config vazio deve usar defaults."""
+    scad = server.generate_box_scad({})
+    assert "module box_floor" in scad
+
+
+def test_empty_config_3d_box():
+    """Edge: config vazio deve usar defaults."""
+    scad = server.generate_3d_box_scad({})
+    assert "module box_body" in scad
+
+
+def test_empty_config_bracket():
+    """Edge: config vazio deve usar defaults."""
+    scad = server.generate_bracket_scad({})
+    assert "bracket_L" in scad
+
+
+def test_empty_config_enclosure():
+    """Edge: config vazio deve usar defaults."""
+    scad = server.generate_enclosure_scad({})
+    assert "module enclosure_body" in scad
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Missing handler tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_export_svg(tmp_path):
+    """Handler: export_svg deve funcionar."""
+    out_path = str(tmp_path / "out.svg")
+    result = await server.handle_call_tool("export_svg", {
+        "scad_code": "square([50, 30]);",
+        "output_path": out_path
+    })
+    assert "Exported" in result[0].text
+    assert os.path.exists(out_path)
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_export_missing_output_path():
+    """Handler: export_stl sem output_path deve dar ValueError."""
+    with pytest.raises(ValueError, match="Missing 'output_path'"):
+        await server.handle_call_tool("export_stl", {
+            "scad_code": "cube([5,5,5]);"
+        })
+
+
+@pytest.mark.asyncio
+async def test_generate_laser_part_missing_args():
+    """Handler: generate_laser_part sem args."""
+    with pytest.raises(ValueError, match="Missing arguments"):
+        await server.handle_call_tool("generate_laser_part", None)
+
+
+@pytest.mark.asyncio
+async def test_generate_finger_test_missing_args():
+    """Handler: generate_finger_test sem args."""
+    with pytest.raises(ValueError, match="Missing arguments"):
+        await server.handle_call_tool("generate_finger_test", None)
+
+
+@pytest.mark.asyncio
+async def test_generate_3d_box_missing_args():
+    """Handler: generate_3d_box sem args."""
+    with pytest.raises(ValueError, match="Missing arguments"):
+        await server.handle_call_tool("generate_3d_box", None)
+
+
+@pytest.mark.asyncio
+async def test_generate_bracket_missing_args():
+    """Handler: generate_bracket sem args."""
+    with pytest.raises(ValueError, match="Missing arguments"):
+        await server.handle_call_tool("generate_bracket", None)
+
+
+@pytest.mark.asyncio
+async def test_generate_enclosure_missing_args():
+    """Handler: generate_enclosure sem args."""
+    with pytest.raises(ValueError, match="Missing arguments"):
+        await server.handle_call_tool("generate_enclosure", None)
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_render_to_png_failure():
+    """Handler: render_to_png com código inválido retorna erro em texto."""
+    result = await server.handle_call_tool("render_to_png", {
+        "scad_code": "INVALID_CODE_THAT_WILL_FAIL_XYZZY({{{}}}});"
+    })
+    # Deve retornar texto com erro, não levantar exceção
+    assert len(result) >= 1
+    assert result[0].type == "text"
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_export_stl_failure():
+    """Handler: export com SCAD inválido retorna erro."""
+    import tempfile
+    out = tempfile.mktemp(suffix=".stl")
+    result = await server.handle_call_tool("export_stl", {
+        "scad_code": "ZZZNONSENSE_MODULE({{});;",
+        "output_path": out
+    })
+    assert len(result) >= 1
+    assert result[0].type == "text"

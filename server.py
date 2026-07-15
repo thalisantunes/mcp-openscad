@@ -3,8 +3,8 @@ import subprocess
 import tempfile
 import asyncio
 import math
-import json
 import shutil
+import base64
 from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
@@ -52,7 +52,7 @@ def check_scad_syntax(scad_code: str) -> tuple:
 
     try:
         result = subprocess.run(
-            ["openscad", "--export-format", "svg", "-o", "/dev/null", scad_path],
+            ["openscad", "--export-format", "svg", "-o", os.devnull, scad_path],
             capture_output=True, text=True, timeout=15
         )
         stderr = result.stderr.strip()
@@ -80,9 +80,11 @@ def generate_laser_scad(config: dict) -> str:
     W   = config.get("width",  100)
     D   = config.get("depth",  100)
     H   = config.get("height", 80)
-    N   = config.get("fingers", 5)
+    N   = max(1, config.get("fingers", 5))
     openings = config.get("openings", [])
 
+    # Clamp kerf to material thickness
+    kerf = min(kerf, t - 0.1)
     slot = t - kerf
     gap  = 15
 
@@ -318,12 +320,14 @@ def generate_box_scad(config: dict) -> str:
     W    = config.get("width", 100)
     D    = config.get("depth", 80)
     H    = config.get("height", 50)
-    N    = config.get("fingers", 5)
+    N    = max(1, config.get("fingers", 5))
     lid  = config.get("lid_type", "snap")
     lc   = config.get("lid_clearance", 0.3)
-    div_x = config.get("dividers_x", 0)
-    div_y = config.get("dividers_y", 0)
+    div_x = max(0, config.get("dividers_x", 0))
+    div_y = max(0, config.get("dividers_y", 0))
 
+    # Clamp kerf to material thickness
+    kerf = min(kerf, t - 0.1)
     slot = t - kerf
     gap  = 15
 
@@ -595,6 +599,10 @@ def generate_kerf_test_scad(config: dict) -> str:
     kerf_step = config.get("kerf_step", 0.05)
     test_len  = config.get("test_length", 30)
 
+    # Guard against infinite loop
+    if kerf_step <= 0:
+        kerf_step = 0.05
+
     kerfs = []
     k = kerf_min
     while k <= kerf_max + 1e-9:
@@ -651,8 +659,12 @@ def generate_finger_test_scad(config: dict) -> str:
     off_max    = config.get("offset_max", 0.2)
     off_step   = config.get("offset_step", 0.05)
     fw         = config.get("finger_width", 5)
-    fn         = config.get("finger_count", 5)
+    fn         = max(1, config.get("finger_count", 5))
     piece_h    = config.get("height", 30)
+
+    # Guard against infinite loop
+    if off_step <= 0:
+        off_step = 0.05
 
     offsets = []
     o = off_min
@@ -685,7 +697,7 @@ fw = {fw};
         macho_tabs = ""
         for j in range(0, fn, 2):
             tx = j * fw
-            macho_tabs += f"        translate([{tx:.3f}, 0]) square([{tab_w:.3f}, {t:.3f}]);\n"
+            macho_tabs += f"        translate([{tx:.3f}, {-t:.3f}]) square([{tab_w:.3f}, {t:.3f}]);\n"
 
         femea_fendas = ""
         for j in range(0, fn, 2):
@@ -830,7 +842,7 @@ if (SHOW_LID) {{
         scad += f"""module box_lid() {{
     rounded_box(W, D, bt, cr);
     // Anel de rosca (aprox.) – use BOSL2 para rosca ISO real
-    translate([wt + tol, wt + tol, bt])
+    translate([W/2, D/2, bt])
         difference() {{
             cylinder(d=min(W,D) - 2*wt - 2*tol, h={lh:.2f}, $fn=64);
             translate([0,0,-0.1]) cylinder(d=min(W,D) - 4*wt - 2*tol, h={lh+0.2:.2f}, $fn=64);
@@ -979,22 +991,46 @@ def generate_enclosure_scad(config: dict) -> str:
         "oled_128x64": (28.0, 12.0),
     }
 
-    def conn_cut(c):
+    def conn_cut_front(c):
+        """Cutout na parede frontal (plano XZ em Y=0)."""
         ctype = c.get("type", "custom")
-        cx    = c.get("x", 10)
-        cy    = c.get("y", 10)
-        if ctype in CONN_CATALOG:
-            cw, ch = CONN_CATALOG[ctype]
-        else:
-            cw = c.get("w", 10)
-            ch = c.get("h", 10)
-        return f"            translate([{cx:.2f}, {cy:.2f}]) square([{cw:.2f}, {ch:.2f}]);"
+        cx, cy = c.get("x", 10), c.get("y", 10)
+        cw, ch = CONN_CATALOG.get(ctype, (c.get("w", 10), c.get("h", 10)))
+        return f"        translate([{cx:.2f}, -0.1, {wall + cy:.2f}]) cube([{cw:.2f}, {wall + 0.2:.2f}, {ch:.2f}]);"
 
-    front_cuts = "\n".join(conn_cut(c) for c in conns if c.get("wall") == "front")
-    back_cuts  = "\n".join(conn_cut(c) for c in conns if c.get("wall") == "back")
-    left_cuts  = "\n".join(conn_cut(c) for c in conns if c.get("wall") == "left")
-    right_cuts = "\n".join(conn_cut(c) for c in conns if c.get("wall") == "right")
-    top_cuts   = "\n".join(conn_cut(c) for c in conns if c.get("wall") == "top")
+    def conn_cut_back(c):
+        """Cutout na parede traseira (plano XZ em Y=D)."""
+        ctype = c.get("type", "custom")
+        cx, cy = c.get("x", 10), c.get("y", 10)
+        cw, ch = CONN_CATALOG.get(ctype, (c.get("w", 10), c.get("h", 10)))
+        return f"        translate([{cx:.2f}, {D - wall - 0.1:.2f}, {wall + cy:.2f}]) cube([{cw:.2f}, {wall + 0.2:.2f}, {ch:.2f}]);"
+
+    def conn_cut_left(c):
+        """Cutout na parede esquerda (plano YZ em X=0)."""
+        ctype = c.get("type", "custom")
+        cx, cy = c.get("x", 10), c.get("y", 10)
+        cw, ch = CONN_CATALOG.get(ctype, (c.get("w", 10), c.get("h", 10)))
+        return f"        translate([-0.1, {cx:.2f}, {wall + cy:.2f}]) cube([{wall + 0.2:.2f}, {cw:.2f}, {ch:.2f}]);"
+
+    def conn_cut_right(c):
+        """Cutout na parede direita (plano YZ em X=W)."""
+        ctype = c.get("type", "custom")
+        cx, cy = c.get("x", 10), c.get("y", 10)
+        cw, ch = CONN_CATALOG.get(ctype, (c.get("w", 10), c.get("h", 10)))
+        return f"        translate([{W - wall - 0.1:.2f}, {cx:.2f}, {wall + cy:.2f}]) cube([{wall + 0.2:.2f}, {cw:.2f}, {ch:.2f}]);"
+
+    def conn_cut_top(c):
+        """Cutout no topo (plano XY em Z=H)."""
+        ctype = c.get("type", "custom")
+        cx, cy = c.get("x", 10), c.get("y", 10)
+        cw, ch = CONN_CATALOG.get(ctype, (c.get("w", 10), c.get("h", 10)))
+        return f"        translate([{cx:.2f}, {cy:.2f}, {H - wall - 0.1:.2f}]) cube([{cw:.2f}, {ch:.2f}, {wall + 0.2:.2f}]);"
+
+    front_cuts = "\n".join(conn_cut_front(c) for c in conns if c.get("wall") == "front")
+    back_cuts  = "\n".join(conn_cut_back(c) for c in conns if c.get("wall") == "back")
+    left_cuts  = "\n".join(conn_cut_left(c) for c in conns if c.get("wall") == "left")
+    right_cuts = "\n".join(conn_cut_right(c) for c in conns if c.get("wall") == "right")
+    top_cuts   = "\n".join(conn_cut_top(c) for c in conns if c.get("wall") == "top")
 
     standoff_code = ""
     for s in soffs:
@@ -1056,26 +1092,16 @@ module enclosure_body() {{
             cube([W+0.2, D+0.2, wall+0.2]);
 
         // ── Recortes de conectores ────────────────────────────
-        // Parede Frontal
-        translate([-0.1, wall, wall]) rotate([0,90,0]) {{
+        // Parede Frontal (Y=0, cortando ao longo de Y)
 {front_cuts}
-        }}
-        // Parede Traseira
-        translate([W+0.1, wall, wall]) rotate([0,-90,0]) {{
+        // Parede Traseira (Y=D)
 {back_cuts}
-        }}
-        // Parede Esquerda
-        translate([wall, -0.1, wall]) rotate([-90,0,0]) rotate([0,0,90]) {{
+        // Parede Esquerda (X=0)
 {left_cuts}
-        }}
-        // Parede Direita
-        translate([wall, D+0.1, wall]) rotate([90,0,0]) rotate([0,0,90]) {{
+        // Parede Direita (X=W)
 {right_cuts}
-        }}
         // Topo
-        translate([wall, wall, H-0.1]) {{
 {top_cuts}
-        }}
     }}
     // ── Pilares para PCB ──────────────────────────────────────
 {standoff_code}}}
@@ -1505,7 +1531,6 @@ async def handle_call_tool(
             try:
                 out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"] + extra_args)
                 with open(out_path, "rb") as f:
-                    import base64
                     img_data = base64.b64encode(f.read()).decode("utf-8")
                 os.remove(out_path)
                 return [
@@ -1570,7 +1595,6 @@ async def handle_call_tool(
 
         try:
             out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
-            import base64
             with open(out_path, "rb") as f:
                 img_data = base64.b64encode(f.read()).decode("utf-8")
             os.remove(out_path)
@@ -1619,7 +1643,6 @@ async def handle_call_tool(
 
         try:
             out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
-            import base64
             with open(out_path, "rb") as f:
                 img_data = base64.b64encode(f.read()).decode("utf-8")
             os.remove(out_path)
@@ -1654,7 +1677,6 @@ async def handle_call_tool(
 
         try:
             out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall", "--projection=ortho"])
-            import base64
             with open(out_path, "rb") as f:
                 img_data = base64.b64encode(f.read()).decode("utf-8")
             os.remove(out_path)
@@ -1690,7 +1712,6 @@ async def handle_call_tool(
 
         try:
             out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall", "--projection=ortho"])
-            import base64
             with open(out_path, "rb") as f:
                 img_data = base64.b64encode(f.read()).decode("utf-8")
             os.remove(out_path)
@@ -1747,7 +1768,6 @@ async def handle_call_tool(
 
         try:
             out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
-            import base64
             with open(out_path, "rb") as f:
                 img_data = base64.b64encode(f.read()).decode("utf-8")
             os.remove(out_path)
@@ -1781,7 +1801,6 @@ async def handle_call_tool(
 
         try:
             out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
-            import base64
             with open(out_path, "rb") as f:
                 img_data = base64.b64encode(f.read()).decode("utf-8")
             os.remove(out_path)
@@ -1818,7 +1837,6 @@ async def handle_call_tool(
 
         try:
             out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
-            import base64
             with open(out_path, "rb") as f:
                 img_data = base64.b64encode(f.read()).decode("utf-8")
             os.remove(out_path)
