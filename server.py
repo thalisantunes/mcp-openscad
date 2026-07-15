@@ -61,6 +61,18 @@ async def handle_list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="export_3mf",
+            description="Export 3D OpenSCAD code to a 3MF file for modern 3D printing.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "scad_code": {"type": "string", "description": "The OpenSCAD source code"},
+                    "output_path": {"type": "string", "description": "Absolute path to save the .3mf file"}
+                },
+                "required": ["scad_code", "output_path"]
+            }
+        ),
+        types.Tool(
             name="export_dxf",
             description="Export 2D OpenSCAD code to a DXF file for laser cutting/CNC.",
             inputSchema={
@@ -109,7 +121,7 @@ async def handle_call_tool(
         except Exception as e:
             return [types.TextContent(type="text", text=str(e))]
 
-    elif name in ["export_stl", "export_dxf", "export_svg"]:
+    elif name in ["export_stl", "export_3mf", "export_dxf", "export_svg"]:
         if "output_path" not in arguments:
             raise ValueError("Missing 'output_path' argument")
         

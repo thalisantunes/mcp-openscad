@@ -6,6 +6,7 @@ An MCP (Model Context Protocol) server for interacting with OpenSCAD. This serve
 
 - **render_to_png**: Render an OpenSCAD script into a PNG preview image.
 - **export_stl**: Export 3D OpenSCAD designs to STL files (for 3D Printing).
+- **export_3mf**: Export 3D OpenSCAD designs to 3MF files (for modern 3D Printing).
 - **export_dxf**: Export 2D OpenSCAD designs to DXF files (for Laser Cutting / CNC).
 - **export_svg**: Export 2D OpenSCAD designs to SVG files (for Laser Engraving / Cutting).
 
