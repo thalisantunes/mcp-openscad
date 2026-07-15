@@ -4,8 +4,8 @@
 - [x] Suporte a STL
 - [x] Suporte a DXF e SVG (2D)
 - [x] Suporte a 3MF (Implementado)
-- [ ] Suporte a exportação CSG (`export_csg`)
-- [ ] Suporte a exportação AMF (`export_amf`)
+- [x] Suporte a exportação CSG (`export_csg`)
+- [x] Suporte a exportação AMF (`export_amf`)
 
 ## Fase 2: Parametrização e Configurações
 - [ ] Suporte a passagem de variáveis (`-D var=value`) para personalizar os modelos.

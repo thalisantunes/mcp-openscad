@@ -73,6 +73,30 @@ async def handle_list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="export_csg",
+            description="Export 3D OpenSCAD code to a CSG file (Constructive Solid Geometry).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "scad_code": {"type": "string", "description": "The OpenSCAD source code"},
+                    "output_path": {"type": "string", "description": "Absolute path to save the .csg file"}
+                },
+                "required": ["scad_code", "output_path"]
+            }
+        ),
+        types.Tool(
+            name="export_amf",
+            description="Export 3D OpenSCAD code to an AMF file (Additive Manufacturing File Format).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "scad_code": {"type": "string", "description": "The OpenSCAD source code"},
+                    "output_path": {"type": "string", "description": "Absolute path to save the .amf file"}
+                },
+                "required": ["scad_code", "output_path"]
+            }
+        ),
+        types.Tool(
             name="export_dxf",
             description="Export 2D OpenSCAD code to a DXF file for laser cutting/CNC.",
             inputSchema={
@@ -121,7 +145,7 @@ async def handle_call_tool(
         except Exception as e:
             return [types.TextContent(type="text", text=str(e))]
 
-    elif name in ["export_stl", "export_3mf", "export_dxf", "export_svg"]:
+    elif name in ["export_stl", "export_3mf", "export_csg", "export_amf", "export_dxf", "export_svg"]:
         if "output_path" not in arguments:
             raise ValueError("Missing 'output_path' argument")
         
