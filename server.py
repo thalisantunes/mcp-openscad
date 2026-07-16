@@ -1939,6 +1939,150 @@ if (SHOW_EXPLODED) {
 
 
 # ──────────────────────────────────────────────
+# generate_cnc_toolpath_hints (v0.5.1)
+# ──────────────────────────────────────────────
+
+# Database de materiais com parâmetros CNC recomendados
+CNC_MATERIALS = {
+    "mdf": {
+        "name": "MDF",
+        "feed_rate_mm_min": 1500, "plunge_rate_mm_min": 500,
+        "spindle_rpm": 18000, "doc_pct": 0.5,
+        "notes": "Material uniforme, bom para iniciantes. Gera pó fino — use aspiração."
+    },
+    "plywood": {
+        "name": "Compensado/Plywood",
+        "feed_rate_mm_min": 1200, "plunge_rate_mm_min": 400,
+        "spindle_rpm": 16000, "doc_pct": 0.4,
+        "notes": "Camadas cruzadas podem causar tear-out. Use fresa upcut para corte, downcut para acabamento."
+    },
+    "acrylic": {
+        "name": "Acrílico",
+        "feed_rate_mm_min": 800, "plunge_rate_mm_min": 300,
+        "spindle_rpm": 14000, "doc_pct": 0.3,
+        "notes": "Não deixe o material derreter. Use fresa de 1 flauta (O-flute). Corte com refrigeração."
+    },
+    "hardwood": {
+        "name": "Madeira dura (carvalho, nogueira)",
+        "feed_rate_mm_min": 1000, "plunge_rate_mm_min": 350,
+        "spindle_rpm": 16000, "doc_pct": 0.35,
+        "notes": "Corte a favor do veio quando possível. Use fresas de 2 flautas."
+    },
+    "softwood": {
+        "name": "Madeira macia (pinus, cedro)",
+        "feed_rate_mm_min": 1800, "plunge_rate_mm_min": 600,
+        "spindle_rpm": 18000, "doc_pct": 0.6,
+        "notes": "Material suave — cuidado com bordas felpudas. Use fresa downcut para acabamento limpo."
+    },
+    "aluminum": {
+        "name": "Alumínio",
+        "feed_rate_mm_min": 500, "plunge_rate_mm_min": 150,
+        "spindle_rpm": 10000, "doc_pct": 0.15,
+        "notes": "Use lubrificação (WD-40 ou fluido de corte). Fresa de 1 flauta. Limpe cavacos frequentemente."
+    },
+    "foam": {
+        "name": "Espuma (EVA, EPS, XPS)",
+        "feed_rate_mm_min": 3000, "plunge_rate_mm_min": 1500,
+        "spindle_rpm": 12000, "doc_pct": 1.0,
+        "notes": "Pode cortar em passe único. Use fresa reta ou lâmina. Velocidade alta, RPM baixo."
+    },
+    "hdpe": {
+        "name": "HDPE / Polietileno",
+        "feed_rate_mm_min": 1000, "plunge_rate_mm_min": 400,
+        "spindle_rpm": 12000, "doc_pct": 0.4,
+        "notes": "Material flexível — fixe bem. Use fresa de 1 flauta (O-flute). Evite acúmulo de calor."
+    },
+}
+
+def generate_cnc_toolpath_hints(config: dict) -> dict:
+    """
+    Gera sugestões de parâmetros CNC: feed rate, spindle, DOC, passes.
+    """
+    material = config.get("material", "mdf").lower()
+    thickness = config.get("material_thickness", 6)
+    tool_d = config.get("tool_d", 3.175)  # 1/8" endmill
+    tool_flutes = config.get("tool_flutes", 2)
+    cut_type = config.get("cut_type", "profile")  # profile, pocket, drill, engrave
+    finishing_pass = config.get("finishing_pass", True)
+
+    mat = CNC_MATERIALS.get(material, CNC_MATERIALS["mdf"])
+
+    # Calcular DOC (depth of cut) por passe
+    doc = tool_d * mat["doc_pct"]
+    num_passes = max(1, math.ceil(thickness / doc))
+    actual_doc = thickness / num_passes
+
+    # Stepover para pockets (% do diâmetro)
+    if cut_type == "pocket":
+        stepover_pct = 0.40  # 40% para pocket
+    elif cut_type == "engrave":
+        stepover_pct = 0.10
+    else:
+        stepover_pct = 1.0  # profile = 100% (single pass)
+    stepover_mm = tool_d * stepover_pct
+
+    # Chip load
+    chip_load = mat["feed_rate_mm_min"] / (mat["spindle_rpm"] * tool_flutes)
+
+    # Tabs para perfil
+    tabs = []
+    if cut_type == "profile":
+        tab_width = max(3, tool_d * 2)
+        tab_height = min(thickness * 0.3, 2.0)
+        tabs = [{
+            "width_mm": round(tab_width, 1),
+            "height_mm": round(tab_height, 1),
+            "note": "Adicione tabs a cada ~50mm do perímetro para manter peça fixada"
+        }]
+
+    result = {
+        "material": mat["name"],
+        "tool_diameter_mm": tool_d,
+        "tool_flutes": tool_flutes,
+        "cut_type": cut_type,
+        "parameters": {
+            "feed_rate_mm_min": mat["feed_rate_mm_min"],
+            "plunge_rate_mm_min": mat["plunge_rate_mm_min"],
+            "spindle_rpm": mat["spindle_rpm"],
+            "depth_per_pass_mm": round(actual_doc, 2),
+            "num_passes": num_passes,
+            "stepover_mm": round(stepover_mm, 2),
+            "stepover_pct": round(stepover_pct * 100, 0),
+            "chip_load_mm": round(chip_load, 4),
+        },
+        "tabs": tabs,
+        "finishing": None,
+        "notes": mat["notes"],
+        "safety": [
+            "🥽 Use óculos de proteção",
+            "🔊 Use proteção auricular",
+            "💨 Use aspiração/exaustão para pó",
+            "🔒 Verifique fixação da peça antes de iniciar",
+            "⚡ Não toque na fresa após o corte (quente)",
+        ],
+    }
+
+    if finishing_pass and cut_type in ("profile", "pocket"):
+        result["finishing"] = {
+            "feed_rate_mm_min": int(mat["feed_rate_mm_min"] * 0.6),
+            "depth_per_pass_mm": round(actual_doc * 0.3, 2),
+            "offset_mm": 0.2,
+            "note": "Passe de acabamento: velocidade reduzida, profundidade menor, offset 0.2mm"
+        }
+
+    # Summary
+    time_est_min = (thickness / actual_doc) * 0.1  # rough estimate
+    result["summary"] = (
+        f"🔧 CNC — {mat['name']} ({thickness}mm) com fresa ⌀{tool_d}mm\n"
+        f"   Feed: {mat['feed_rate_mm_min']}mm/min | RPM: {mat['spindle_rpm']} | "
+        f"DOC: {actual_doc:.2f}mm × {num_passes} passes\n"
+        f"   Chip load: {chip_load:.4f}mm | Stepover: {stepover_mm:.2f}mm ({stepover_pct*100:.0f}%)"
+    )
+
+    return result
+
+
+# ──────────────────────────────────────────────
 # Registro das ferramentas MCP
 # ──────────────────────────────────────────────
 @server.list_tools()
@@ -2391,6 +2535,29 @@ async def handle_list_tools() -> list:
                     "project_name": {"type": "string"}
                 },
                 "required": ["output_dir", "project_name"]
+            }
+        ),
+        # CNC
+        types.Tool(
+            name="generate_cnc_toolpath_hints",
+            description=(
+                "Gera sugestões de parâmetros CNC (feed rate, RPM, DOC, passes, chip load) "
+                "para um material e fresa específicos. "
+                "Materiais: mdf, plywood, acrylic, hardwood, softwood, aluminum, foam, hdpe."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "config": {
+                        "type": "object",
+                        "description": (
+                            "material (mdf|plywood|acrylic|hardwood|softwood|aluminum|foam|hdpe), "
+                            "material_thickness, tool_d, tool_flutes, "
+                            "cut_type (profile|pocket|drill|engrave), finishing_pass"
+                        )
+                    }
+                },
+                "required": ["config"]
             }
         ),
     ]
@@ -2995,6 +3162,42 @@ async def handle_call_tool(
             results.append(f"❌ Erro PNG: {e}")
             return [types.TextContent(type="text", text="\n".join(results))]
 
+    elif name == "generate_cnc_toolpath_hints":
+        if not arguments or "config" not in arguments:
+            raise ValueError("Missing 'config'")
+        r = generate_cnc_toolpath_hints(arguments["config"])
+        lines = [r["summary"], ""]
+        p = r["parameters"]
+        lines.append("📊 Parâmetros recomendados:")
+        lines.append(f"  Feed rate:    {p['feed_rate_mm_min']} mm/min")
+        lines.append(f"  Plunge rate:  {p['plunge_rate_mm_min']} mm/min")
+        lines.append(f"  Spindle RPM:  {p['spindle_rpm']}")
+        lines.append(f"  DOC/passe:    {p['depth_per_pass_mm']}mm × {p['num_passes']} passes")
+        lines.append(f"  Stepover:     {p['stepover_mm']}mm ({p['stepover_pct']:.0f}%)")
+        lines.append(f"  Chip load:    {p['chip_load_mm']}mm")
+        lines.append("")
+
+        if r["tabs"]:
+            t = r["tabs"][0]
+            lines.append(f"📌 Tabs: {t['width_mm']}mm × {t['height_mm']}mm")
+            lines.append(f"   {t['note']}")
+            lines.append("")
+
+        if r["finishing"]:
+            f_data = r["finishing"]
+            lines.append(f"✨ Passe de acabamento:")
+            lines.append(f"   Feed: {f_data['feed_rate_mm_min']} mm/min | DOC: {f_data['depth_per_pass_mm']}mm")
+            lines.append(f"   {f_data['note']}")
+            lines.append("")
+
+        lines.append(f"📝 {r['notes']}")
+        lines.append("")
+        lines.append("⚠ Segurança:")
+        for s in r["safety"]:
+            lines.append(f"  {s}")
+
+        return [types.TextContent(type="text", text="\n".join(lines))]
+
     else:
         raise ValueError(f"Unknown tool: {name}")
 
@@ -3014,5 +3217,10 @@ async def main():
             ),
         )
 
-if __name__ == "__main__":
+
+def main_sync():
+    """Synchronous entry point for PyPI script installation."""
     asyncio.run(main())
+
+if __name__ == "__main__":
+    main_sync()

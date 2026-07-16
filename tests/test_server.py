@@ -531,7 +531,9 @@ async def test_handle_list_tools():
     # Orientation + Assembly
     assert "suggest_orientation"        in tool_names
     assert "generate_assembly"          in tool_names
-    assert len(tools) == 23
+    # CNC
+    assert "generate_cnc_toolpath_hints" in tool_names
+    assert len(tools) == 24
 
 
 @pytest.mark.asyncio
@@ -1725,4 +1727,106 @@ def test_openscad_renders_assembly():
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 100
     os.remove(out_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# generate_cnc_toolpath_hints
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_cnc_toolpath_hints_mdf_default():
+    """MDF com defaults: feed 1500, RPM 18000."""
+    r = server.generate_cnc_toolpath_hints({})
+    assert r["material"] == "MDF"
+    assert r["parameters"]["feed_rate_mm_min"] == 1500
+    assert r["parameters"]["spindle_rpm"] == 18000
+    assert r["parameters"]["num_passes"] >= 1
+    assert "summary" in r
+
+
+def test_cnc_toolpath_hints_aluminum():
+    """Alumínio: parâmetros conservadores."""
+    r = server.generate_cnc_toolpath_hints({"material": "aluminum", "material_thickness": 3})
+    assert r["material"] == "Alumínio"
+    assert r["parameters"]["feed_rate_mm_min"] == 500
+    assert r["parameters"]["spindle_rpm"] == 10000
+    assert r["parameters"]["num_passes"] >= 1
+
+
+def test_cnc_toolpath_hints_pocket_stepover():
+    """Pocket: stepover deve ser ~40%."""
+    r = server.generate_cnc_toolpath_hints({"cut_type": "pocket", "tool_d": 6})
+    assert r["parameters"]["stepover_pct"] == 40.0
+    assert abs(r["parameters"]["stepover_mm"] - 2.4) < 0.01
+
+
+def test_cnc_toolpath_hints_profile_has_tabs():
+    """Profile: deve incluir tabs."""
+    r = server.generate_cnc_toolpath_hints({"cut_type": "profile"})
+    assert len(r["tabs"]) > 0
+    assert r["tabs"][0]["width_mm"] > 0
+
+
+def test_cnc_toolpath_hints_engrave_no_tabs():
+    """Engrave: sem tabs, stepover baixo."""
+    r = server.generate_cnc_toolpath_hints({"cut_type": "engrave"})
+    assert len(r["tabs"]) == 0
+    assert r["parameters"]["stepover_pct"] == 10.0
+
+
+def test_cnc_toolpath_hints_finishing_pass():
+    """Finishing pass: incluído por padrão em profile."""
+    r = server.generate_cnc_toolpath_hints({"cut_type": "profile", "finishing_pass": True})
+    assert r["finishing"] is not None
+    assert r["finishing"]["feed_rate_mm_min"] < r["parameters"]["feed_rate_mm_min"]
+
+
+def test_cnc_toolpath_hints_no_finishing():
+    """Sem finishing pass."""
+    r = server.generate_cnc_toolpath_hints({"cut_type": "profile", "finishing_pass": False})
+    assert r["finishing"] is None
+
+
+def test_cnc_toolpath_hints_unknown_material():
+    """Material desconhecido: fallback para MDF."""
+    r = server.generate_cnc_toolpath_hints({"material": "titanium"})
+    assert r["material"] == "MDF"  # fallback
+
+
+def test_cnc_toolpath_hints_all_materials():
+    """Todos os materiais do catálogo retornam resultados."""
+    for mat in ["mdf", "plywood", "acrylic", "hardwood", "softwood", "aluminum", "foam", "hdpe"]:
+        r = server.generate_cnc_toolpath_hints({"material": mat})
+        assert r["parameters"]["feed_rate_mm_min"] > 0
+        assert r["parameters"]["spindle_rpm"] > 0
+
+
+def test_cnc_toolpath_hints_chip_load():
+    """Chip load é calculado corretamente."""
+    r = server.generate_cnc_toolpath_hints({"tool_flutes": 1})
+    expected = 1500 / (18000 * 1)
+    assert abs(r["parameters"]["chip_load_mm"] - round(expected, 4)) < 0.0001
+
+
+def test_cnc_toolpath_hints_safety():
+    """Safety notes incluídas."""
+    r = server.generate_cnc_toolpath_hints({})
+    assert len(r["safety"]) >= 5
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_cnc_toolpath_hints():
+    """Handler: CNC toolpath hints retorna texto formatado."""
+    result = await server.handle_call_tool("generate_cnc_toolpath_hints", {
+        "config": {"material": "acrylic", "material_thickness": 5, "tool_d": 3.175}
+    })
+    assert len(result) >= 1
+    assert "Feed rate" in result[0].text or "CNC" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_cnc_toolpath_hints_missing_config():
+    """Handler: sem config."""
+    with pytest.raises(ValueError, match="Missing"):
+        await server.handle_call_tool("generate_cnc_toolpath_hints", {})
+
 

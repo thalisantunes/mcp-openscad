@@ -2,11 +2,11 @@
 
 > Servidor MCP (Model Context Protocol) que permite agentes de IA interagir com o OpenSCAD para gerar, renderizar e exportar designs CAD paramétricos para fabricação digital — laser cutting, impressão 3D e CNC.
 
-## Versão atual: v0.3.0
+## Versão atual: v0.4.0
 
-### Ferramentas disponíveis (16)
+### Ferramentas disponíveis (24)
 
-#### Exportação Básica
+#### Exportação Básica (6)
 | Ferramenta | Descrição |
 |---|---|
 | `render_to_png` | Preview PNG de qualquer código SCAD |
@@ -16,23 +16,39 @@
 | `export_svg` | Exporta SVG para laser / gravação |
 | `check_syntax` | Valida sintaxe SCAD sem renderizar (rápido) |
 
-#### Corte a Laser
+#### Corte a Laser (8)
 | Ferramenta | Descrição |
 |---|---|
-| `generate_laser_part` | Gera 2D+3D com finger joints, aberturas (porta/janela), layout automático → SCAD+SVG+DXF+PNG |
+| `generate_laser_part` | Gera 2D+3D com finger joints, aberturas, layout automático → SCAD+SVG+DXF+PNG |
 | `validate_laser_config` | Detecta problemas geométricos antes de cortar |
 | `generate_box` | Caixa retangular com tampa (snap/slide/none) e divisórias internas |
-| `generate_kerf_test` | Placa de calibração de kerf — pinos macho + fendas fêmea com kerf variado |
+| `generate_kerf_test` | Placa de calibração de kerf — pinos macho + fendas fêmea |
 | `generate_finger_test` | Pente de teste de finger joints com múltiplos offsets |
 | `estimate_material_use` | Calcula área total e aproveitamento da chapa |
+| `generate_living_hinge` | Padrão de living hinge (straight/serpentine/cross) para MDF flexível |
+| `generate_dogbone` | Pocket com compensação dogbone/T-bone para cantos CNC |
 
-#### Impressão 3D
+#### Impressão 3D (8)
 | Ferramenta | Descrição |
 |---|---|
 | `generate_3d_box` | Caixa sólida paramétrica com tampa snap-fit ou rosqueável |
 | `generate_bracket` | Suporte/mancal paramétrico (tipo L, U ou flat) com furos de montagem |
 | `generate_enclosure` | Gabinete eletrônico com catálogo de conectores e pilares para PCB |
 | `validate_printability` | Valida imprimibilidade: paredes, overhang, layer height, proporções |
+| `suggest_orientation` | Sugere a melhor orientação de impressão com análise de 3 eixos |
+| `generate_tolerance_test` | Placa de calibração de tolerância — pinos + furos com tolerância variada |
+| `generate_bed_level_test` | Grid de discos finos para teste de nivelamento da cama |
+| `generate_retraction_test` | Torres para teste de retração/stringing |
+
+#### Multi-peça e Assembly (1)
+| Ferramenta | Descrição |
+|---|---|
+| `generate_assembly` | Projeto multi-peça com vista explodida e BOM automático em Markdown |
+
+#### CNC (1)
+| Ferramenta | Descrição |
+|---|---|
+| `generate_cnc_toolpath_hints` | Sugestões de parâmetros CNC (feed, RPM, DOC) por material e fresa |
 
 ## Instalação
 
@@ -82,15 +98,6 @@ python server.py
 }
 ```
 
-### Teste de kerf
-```json
-{
-  "tool": "generate_kerf_test",
-  "config": { "material_thickness": 3, "kerf_min": 0.1, "kerf_max": 0.4, "kerf_step": 0.05 },
-  "output_dir": "/tmp", "project_name": "kerf_mdf3"
-}
-```
-
 ### Gabinete eletrônico
 ```json
 {
@@ -105,6 +112,63 @@ python server.py
     "pcb_standoffs": [{"x": 5,"y":5},{"x":110,"y":5},{"x":5,"y":70},{"x":110,"y":70}]
   },
   "output_dir": "/tmp/gabinete", "project_name": "esp32_case"
+}
+```
+
+### Living hinge para laser
+```json
+{
+  "tool": "generate_living_hinge",
+  "config": {
+    "width": 200, "height": 100,
+    "material_thickness": 3, "kerf": 0.2,
+    "pattern": "serpentine", "cut_length": 15
+  },
+  "output_dir": "/tmp/hinge", "project_name": "flex_cover"
+}
+```
+
+### Assembly multi-peça com BOM
+```json
+{
+  "tool": "generate_assembly",
+  "config": {
+    "project_name": "caixa_simples",
+    "pieces": [
+      {"name": "base", "w": 100, "d": 60, "h": 3, "color": [0.9, 0.8, 0.6]},
+      {"name": "front", "w": 100, "d": 3, "h": 40, "translate": [0,0,3], "color": [0.7, 0.5, 0.4]},
+      {"name": "back", "w": 100, "d": 3, "h": 40, "translate": [0,57,3], "color": [0.7, 0.5, 0.4]},
+      {"name": "left", "w": 3, "d": 54, "h": 40, "translate": [0,3,3], "color": [0.6, 0.5, 0.5]},
+      {"name": "right", "w": 3, "d": 54, "h": 40, "translate": [97,3,3], "color": [0.6, 0.5, 0.5]}
+    ]
+  },
+  "output_dir": "/tmp/assembly", "project_name": "caixa_asm"
+}
+```
+
+### Sugestão de orientação para impressão 3D
+```json
+{
+  "tool": "suggest_orientation",
+  "config": {
+    "width": 80, "depth": 60, "height": 200,
+    "has_flat_bottom": true, "has_holes_yz": true,
+    "profile": "fdm_standard"
+  }
+}
+```
+
+### Parâmetros CNC
+```json
+{
+  "tool": "generate_cnc_toolpath_hints",
+  "config": {
+    "material": "acrylic",
+    "material_thickness": 5,
+    "tool_d": 3.175,
+    "cut_type": "pocket",
+    "finishing_pass": true
+  }
 }
 ```
 
@@ -132,7 +196,7 @@ python -m pytest tests/ -v
 python -m pytest tests/ --cov=server --cov-report=term-missing
 ```
 
-Cobertura atual: **90%** — 84 testes.
+Cobertura atual: **93%** — 197 testes.
 
 ## Roadmap
 
@@ -144,6 +208,19 @@ Ver [ROADMAP.md](./ROADMAP.md) para o plano completo.
 |---|---|---|---|
 | MDF 3mm | 0.2mm | 0.2mm | 2.8mm |
 | Acrílico 3mm | 0.15mm | — | — |
+
+## Materiais CNC suportados
+
+| Material | Feed rate | Spindle RPM | DOC (% fresa) |
+|---|---|---|---|
+| MDF | 1500 mm/min | 18000 | 50% |
+| Plywood | 1200 mm/min | 16000 | 40% |
+| Acrílico | 800 mm/min | 14000 | 30% |
+| Madeira dura | 1000 mm/min | 16000 | 35% |
+| Madeira macia | 1800 mm/min | 18000 | 60% |
+| Alumínio | 500 mm/min | 10000 | 15% |
+| Espuma | 3000 mm/min | 12000 | 100% |
+| HDPE | 1000 mm/min | 12000 | 40% |
 
 ## Stack técnico
 
