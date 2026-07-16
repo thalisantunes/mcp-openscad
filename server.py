@@ -1126,6 +1126,268 @@ if (SHOW_LID) {{
 
 
 # ──────────────────────────────────────────────
+# generate_living_hinge
+# ──────────────────────────────────────────────
+
+def generate_living_hinge_scad(config: dict) -> str:
+    """
+    Gera padrão de living hinge para corte a laser.
+    Suporta padrões: straight, serpentine, cross.
+    Saída 2D para exportação SVG/DXF.
+    """
+    W       = max(10, config.get("width", 100))
+    H       = max(10, config.get("height", 60))
+    t       = config.get("material_thickness", 3)
+    kerf    = config.get("kerf", 0.2)
+    pattern = config.get("pattern", "straight")
+    cut_len = max(1, config.get("cut_length", 15))
+    cut_gap = max(0.5, config.get("cut_gap", 2))
+    row_sp  = max(0.5, config.get("row_spacing", 3))
+    margin  = max(0, config.get("margin", 5))
+
+    # Clamp kerf
+    kerf = max(0.05, min(kerf, t - 0.1 if t > 0.1 else 0.05))
+
+    # Valid patterns
+    if pattern not in ("straight", "serpentine", "cross"):
+        pattern = "straight"
+
+    inner_w = W - 2 * margin
+    inner_h = H - 2 * margin
+
+    # Guard: if inner area too small, just return base rectangle
+    if inner_w < cut_len or inner_h < cut_len:
+        return f"""// Living Hinge — área interna insuficiente
+square([{W}, {H}]);
+"""
+
+    scad = f"""// ============================================================
+// Living Hinge — Gerado pelo MCP-OpenSCAD
+// {W}x{H}mm | Material: {t}mm | Kerf: {kerf}mm | Padrão: {pattern}
+// cut_length: {cut_len}mm | cut_gap: {cut_gap}mm | row_spacing: {row_sp}mm
+// ============================================================
+
+"""
+
+    if pattern == "straight":
+        # Parallel rows of cuts, alternating offset by half cut_length + half cut_gap
+        cut_lines = []
+        y = margin
+        row_idx = 0
+        while y + kerf <= H - margin:
+            # Offset for alternating rows
+            x_offset = margin if row_idx % 2 == 0 else margin + (cut_len + cut_gap) / 2
+            x = x_offset
+            while x + cut_len <= W - margin:
+                cut_lines.append(
+                    f"        translate([{x:.4f}, {y:.4f}]) square([{cut_len:.4f}, {kerf:.4f}]);"
+                )
+                x += cut_len + cut_gap
+            y += row_sp
+            row_idx += 1
+
+        scad += f"""difference() {{
+    square([{W}, {H}]);
+    // Cortes straight
+{chr(10).join(cut_lines)}
+}}
+"""
+
+    elif pattern == "serpentine":
+        # Serpentine: long cuts alternating left/right with short bridges
+        cut_lines = []
+        y = margin
+        row_idx = 0
+        while y + kerf <= H - margin:
+            if row_idx % 2 == 0:
+                # Cut from left, leave bridge on right
+                x0 = margin
+                x1 = W - margin - cut_gap
+                cut_lines.append(
+                    f"        translate([{x0:.4f}, {y:.4f}]) square([{x1 - x0:.4f}, {kerf:.4f}]);"
+                )
+            else:
+                # Cut from right, leave bridge on left
+                x0 = margin + cut_gap
+                x1 = W - margin
+                cut_lines.append(
+                    f"        translate([{x0:.4f}, {y:.4f}]) square([{x1 - x0:.4f}, {kerf:.4f}]);"
+                )
+            y += row_sp
+            row_idx += 1
+
+        scad += f"""difference() {{
+    square([{W}, {H}]);
+    // Cortes serpentine
+{chr(10).join(cut_lines)}
+}}
+"""
+
+    elif pattern == "cross":
+        # Cross-hatch: cuts in both X and Y directions
+        cut_lines = []
+        # Horizontal cuts
+        y = margin
+        row_idx = 0
+        while y + kerf <= H - margin:
+            x_offset = margin if row_idx % 2 == 0 else margin + (cut_len + cut_gap) / 2
+            x = x_offset
+            while x + cut_len <= W - margin:
+                cut_lines.append(
+                    f"        translate([{x:.4f}, {y:.4f}]) square([{cut_len:.4f}, {kerf:.4f}]);"
+                )
+                x += cut_len + cut_gap
+            y += row_sp
+            row_idx += 1
+
+        # Vertical cuts
+        x = margin
+        col_idx = 0
+        while x + kerf <= W - margin:
+            y_offset = margin if col_idx % 2 == 0 else margin + (cut_len + cut_gap) / 2
+            y = y_offset
+            while y + cut_len <= H - margin:
+                cut_lines.append(
+                    f"        translate([{x:.4f}, {y:.4f}]) square([{kerf:.4f}, {cut_len:.4f}]);"
+                )
+                y += cut_len + cut_gap
+            x += row_sp
+            col_idx += 1
+
+        scad += f"""difference() {{
+    square([{W}, {H}]);
+    // Cortes cross-hatch
+{chr(10).join(cut_lines)}
+}}
+"""
+
+    return scad
+
+
+# ──────────────────────────────────────────────
+# generate_dogbone
+# ──────────────────────────────────────────────
+
+def generate_dogbone_scad(config: dict) -> str:
+    """
+    Gera pocket retangular com compensação dogbone/T-bone nos cantos
+    para fresagem CNC. Saída 2D para exportação SVG/DXF.
+    Inclui layout de teste com múltiplos tamanhos de pocket.
+    """
+    W      = max(5, config.get("width", 50))
+    H      = max(5, config.get("height", 30))
+    depth  = config.get("depth", 5)
+    tool_d = max(0.1, config.get("tool_d", 3.175))
+    style  = config.get("corner_style", "dogbone")
+    mat_t  = config.get("material_thickness", 6)
+
+    # Valid styles
+    if style not in ("dogbone", "tbone_h", "tbone_v"):
+        style = "dogbone"
+
+    r = tool_d / 2
+    # Diagonal offset for dogbone: circle center at 45° into the corner
+    diag = r * math.sqrt(2) / 2
+
+    def corner_circles(w, h, st):
+        """Gera círculos de compensação nos 4 cantos do pocket."""
+        lines = []
+        corners = [
+            (0, 0),       # bottom-left
+            (w, 0),       # bottom-right
+            (w, h),       # top-right
+            (0, h),       # top-left
+        ]
+        # Direction vectors pointing diagonally into the rectangle
+        diag_dirs = [
+            (diag, diag),    # bottom-left -> into
+            (-diag, diag),   # bottom-right -> into
+            (-diag, -diag),  # top-right -> into
+            (diag, -diag),   # top-left -> into
+        ]
+        # T-bone horizontal: offset along X axis
+        tbone_h_dirs = [
+            (r, 0),   (-r, 0),   (-r, 0),   (r, 0),
+        ]
+        # T-bone vertical: offset along Y axis
+        tbone_v_dirs = [
+            (0, r),   (0, r),   (0, -r),   (0, -r),
+        ]
+
+        if st == "dogbone":
+            dirs = diag_dirs
+        elif st == "tbone_h":
+            dirs = tbone_h_dirs
+        else:  # tbone_v
+            dirs = tbone_v_dirs
+
+        for (cx, cy), (dx, dy) in zip(corners, dirs):
+            lines.append(
+                f"        translate([{cx + dx:.4f}, {cy + dy:.4f}]) circle(r={r:.4f}, $fn=32);"
+            )
+        return "\n".join(lines)
+
+    def pocket_module(name, w, h, st):
+        """Gera um módulo de pocket com compensação."""
+        circles = corner_circles(w, h, st)
+        return f"""module {name}() {{
+    union() {{
+        square([{w:.4f}, {h:.4f}]);
+        // Compensação {st} nos cantos (tool_d={tool_d}mm)
+{circles}
+    }}
+}}
+"""
+
+    scad = f"""// ============================================================
+// Dogbone/T-bone Pocket — Gerado pelo MCP-OpenSCAD
+// Pocket: {W}x{H}mm | Profundidade: {depth}mm | Fresa: Ø{tool_d}mm
+// Estilo: {style} | Material: {mat_t}mm
+// ============================================================
+$fn = 32;
+
+"""
+
+    # Main pocket module
+    scad += pocket_module("main_pocket", W, H, style)
+
+    # Test layout with multiple pocket sizes
+    gap = 10
+    test_sizes = [
+        (W, H, "full_size"),
+        (W * 0.75, H * 0.75, "size_75pct"),
+        (W * 0.5, H * 0.5, "size_50pct"),
+    ]
+
+    for tw, th, tname in test_sizes:
+        tw = max(tool_d * 2, tw)
+        th = max(tool_d * 2, th)
+        scad += pocket_module(f"pocket_{tname}", tw, th, style)
+
+    # Layout
+    scad += f"""// ── Layout de teste ──────────────────────────────────────────
+module test_layout() {{
+"""
+    x_off = 0
+    for tw, th, tname in test_sizes:
+        tw = max(tool_d * 2, tw)
+        th = max(tool_d * 2, th)
+        scad += f"    translate([{x_off:.4f}, 0]) pocket_{tname}();\n"
+        x_off += tw + gap
+
+    scad += """}\n\n"""
+
+    scad += f"""// Pocket principal
+main_pocket();
+
+// Layout de teste abaixo
+translate([0, {H + gap:.4f}]) test_layout();
+"""
+
+    return scad
+
+
+# ──────────────────────────────────────────────
 # validate_printability
 # ──────────────────────────────────────────────
 
@@ -1206,6 +1468,474 @@ def validate_printability(config: dict) -> dict:
             f"({len(errors)} erro(s), {len(warnings)} aviso(s))"
         )
     }
+
+
+# ──────────────────────────────────────────────
+# generate_tolerance_test
+# ──────────────────────────────────────────────
+
+def generate_tolerance_test_scad(config: dict) -> str:
+    """
+    Gera placa de teste de tolerância para calibração de impressão 3D.
+    Pares de pinos macho e furos fêmea com tolerâncias variadas.
+    """
+    base_w   = config.get("base_width", 80)
+    base_d   = config.get("base_depth", 60)
+    base_h   = config.get("base_height", 3)
+    pin_h    = config.get("pin_height", 15)
+    pin_d    = config.get("pin_d", 10)
+    hole_d   = config.get("hole_d", 10)
+    tol_min  = config.get("tol_min", -0.3)
+    tol_max  = config.get("tol_max", 0.3)
+    tol_step = config.get("tol_step", 0.1)
+    gap      = config.get("gap", 5)
+
+    # Guard against infinite loop
+    if tol_step <= 0:
+        tol_step = 0.1
+
+    tols = []
+    t = tol_min
+    while t <= tol_max + 1e-9:
+        tols.append(round(t, 4))
+        t += tol_step
+
+    n = len(tols)
+    # Compute required base width: each pair needs pin_d + gap + hole_d + gap
+    pair_w = pin_d + gap + hole_d + gap
+    min_w  = gap + n * pair_w
+    base_w = max(base_w, min_w)
+
+    # Compute required base depth: pin_d + gap + label space
+    min_d  = pin_d + gap * 2 + 10
+    base_d = max(base_d, min_d)
+
+    scad = f"""// ============================================================
+// Placa de Teste de Tolerância — MCP-OpenSCAD
+// Tolerância: {tol_min} a {tol_max}mm | Passo: {tol_step}mm
+// ============================================================
+// Como usar:
+//   1. Imprima esta placa
+//   2. Tente encaixar cada pino no furo correspondente
+//   3. O par com encaixe justo = tolerância correta da sua impressora
+// ============================================================
+$fn = 64;
+
+"""
+
+    # Base plate
+    scad += f"""// ── Base ─────────────────────────────────────────────────────
+difference() {{
+    cube([{base_w:.3f}, {base_d:.3f}, {base_h:.3f}]);
+"""
+
+    # Female holes (subtracted from base)
+    for i, tol in enumerate(tols):
+        hx = gap + i * pair_w + pin_d + gap + hole_d / 2
+        hy = base_d / 2
+        effective_hole_d = hole_d - tol
+        scad += f"""    // Furo fêmea tol={tol:+.2f}mm (d={effective_hole_d:.3f}mm)
+    translate([{hx:.3f}, {hy:.3f}, -0.1])
+        cylinder(d={effective_hole_d:.3f}, h={base_h + 0.2:.3f});
+"""
+
+    scad += "}\n\n"
+
+    # Male pins (on top of base)
+    for i, tol in enumerate(tols):
+        px = gap + i * pair_w + pin_d / 2
+        py = base_d / 2
+        effective_pin_d = pin_d + tol
+        scad += f"""// Pino macho tol={tol:+.2f}mm (d={effective_pin_d:.3f}mm)
+translate([{px:.3f}, {py:.3f}, {base_h:.3f}])
+    cylinder(d={effective_pin_d:.3f}, h={pin_h:.3f});
+"""
+
+    # Labels
+    for i, tol in enumerate(tols):
+        lx = gap + i * pair_w + pair_w / 2
+        ly = 2
+        scad += f"""// Label tol={tol:+.2f}mm
+translate([{lx:.3f}, {ly:.3f}, {base_h - 0.5:.3f}])
+    linear_extrude(1)
+        text("{tol:+.1f}", size=4, halign="center", font="Liberation Sans:style=Bold");
+"""
+
+    return scad
+
+
+# ──────────────────────────────────────────────
+# generate_bed_level_test
+# ──────────────────────────────────────────────
+
+def generate_bed_level_test_scad(config: dict) -> str:
+    """
+    Gera padrão de teste de nivelamento de mesa para impressão 3D.
+    Grade de discos finos distribuídos pela área da mesa.
+    """
+    bed_x     = config.get("bed_x", 220)
+    bed_y     = config.get("bed_y", 220)
+    disc_d    = config.get("disc_d", 30)
+    disc_h    = config.get("disc_h", 0.2)
+    grid_cols = max(1, config.get("grid_cols", 5))
+    grid_rows = max(1, config.get("grid_rows", 5))
+    skirt_w   = config.get("skirt_w", 1)
+
+    scad = f"""// ============================================================
+// Teste de Nivelamento de Mesa — MCP-OpenSCAD
+// Mesa: {bed_x}x{bed_y}mm | Discos: {grid_cols}x{grid_rows} | d={disc_d}mm h={disc_h}mm
+// ============================================================
+// Como usar:
+//   1. Imprima este padrão na sua mesa
+//   2. Observe a adesão e espessura de cada disco
+//   3. Discos mal aderidos = mesa desnivelada naquela região
+// ============================================================
+$fn = 64;
+
+"""
+
+    # Calculate spacing
+    margin_x = disc_d / 2 + 5
+    margin_y = disc_d / 2 + 5
+    if grid_cols > 1:
+        step_x = (bed_x - 2 * margin_x) / (grid_cols - 1)
+    else:
+        step_x = 0
+    if grid_rows > 1:
+        step_y = (bed_y - 2 * margin_y) / (grid_rows - 1)
+    else:
+        step_y = 0
+
+    for row in range(grid_rows):
+        for col in range(grid_cols):
+            cx = margin_x + col * step_x
+            cy = margin_y + row * step_y
+
+            # Skirt ring around disc
+            if skirt_w > 0:
+                outer_d = disc_d + 2 * skirt_w
+                scad += f"""// Disco [{col},{row}] com saia
+translate([{cx:.3f}, {cy:.3f}, 0]) {{
+    cylinder(d={disc_d:.3f}, h={disc_h:.3f});
+    difference() {{
+        cylinder(d={outer_d:.3f}, h={disc_h:.3f});
+        translate([0, 0, -0.1]) cylinder(d={disc_d:.3f}, h={disc_h + 0.2:.3f});
+    }}
+}}
+"""
+            else:
+                scad += f"""// Disco [{col},{row}]
+translate([{cx:.3f}, {cy:.3f}, 0])
+    cylinder(d={disc_d:.3f}, h={disc_h:.3f});
+"""
+
+    return scad
+
+
+# ──────────────────────────────────────────────
+# generate_retraction_test
+# ──────────────────────────────────────────────
+
+def generate_retraction_test_scad(config: dict) -> str:
+    """
+    Gera torre de teste de retração/stringing para impressão 3D.
+    Cilindros finos espaçados em base comum — stringing entre torres
+    indica retração insuficiente.
+    """
+    tower_d     = config.get("tower_d", 10)
+    tower_h     = config.get("tower_h", 80)
+    tower_count = max(1, config.get("tower_count", 5))
+    tower_gap   = config.get("tower_gap", 20)
+    base_h      = config.get("base_h", 2)
+    base_pad    = config.get("base_pad", 5)
+
+    total_w = tower_count * tower_d + (tower_count - 1) * tower_gap + 2 * base_pad
+    total_d = tower_d + 2 * base_pad
+
+    scad = f"""// ============================================================
+// Torre de Teste de Retração — MCP-OpenSCAD
+// Torres: {tower_count} x d={tower_d}mm h={tower_h}mm | Gap: {tower_gap}mm
+// ============================================================
+// Como usar:
+//   1. Imprima esta peça
+//   2. Observe os fios (strings) entre as torres
+//   3. Muita stringing = aumente retração ou diminua temperatura
+// ============================================================
+$fn = 64;
+
+// ── Base ─────────────────────────────────────────────────────
+cube([{total_w:.3f}, {total_d:.3f}, {base_h:.3f}]);
+
+"""
+
+    for i in range(tower_count):
+        cx = base_pad + tower_d / 2 + i * (tower_d + tower_gap)
+        cy = total_d / 2
+        scad += f"""// Torre {i+1}
+translate([{cx:.3f}, {cy:.3f}, {base_h:.3f}])
+    cylinder(d={tower_d:.3f}, h={tower_h:.3f});
+"""
+
+    return scad
+
+
+# ──────────────────────────────────────────────
+# suggest_orientation (v0.4.2)
+# ──────────────────────────────────────────────
+
+def suggest_orientation(config: dict) -> dict:
+    """
+    Sugere a melhor orientação de impressão 3D baseado na geometria.
+    Analisa proporções, overhangs potenciais e área de contato com a cama.
+    """
+    W = config.get("width", 80)
+    D = config.get("depth", 60)
+    H = config.get("height", 40)
+    has_holes_xy = config.get("has_holes_xy", False)
+    has_holes_xz = config.get("has_holes_xz", False)
+    has_holes_yz = config.get("has_holes_yz", False)
+    has_flat_bottom = config.get("has_flat_bottom", True)
+    detail_on_top = config.get("detail_on_top", False)
+    profile = config.get("profile", "fdm_standard")
+
+    PROFILES = {
+        "fdm_standard": {"max_overhang": 45, "support_cost": "alto"},
+        "fdm_fine":     {"max_overhang": 50, "support_cost": "alto"},
+        "resin":        {"max_overhang": 70, "support_cost": "baixo"},
+    }
+    prof = PROFILES.get(profile, PROFILES["fdm_standard"])
+
+    orientations = []
+
+    # Orientation 1: Original (Z up)
+    base_area_z = W * D
+    score_z = 100
+    notes_z = []
+    if has_flat_bottom:
+        score_z += 20
+        notes_z.append("✅ Base plana — boa aderência à cama")
+    if H > max(W, D) * 3:
+        score_z -= 30
+        notes_z.append("⚠ Muito alto — risco de tombar, use brim/raft")
+    if has_holes_xy:
+        score_z += 10
+        notes_z.append("✅ Furos no plano XY imprimem sem suporte")
+    if has_holes_xz or has_holes_yz:
+        score_z -= 15
+        notes_z.append("⚠ Furos laterais podem precisar de suporte")
+    if detail_on_top:
+        score_z += 5
+        notes_z.append("✅ Detalhes no topo — boa resolução nessa orientação")
+    orientations.append({
+        "name": "Original (Z ↑)",
+        "rotation": [0, 0, 0],
+        "base_area_mm2": round(base_area_z, 1),
+        "height_mm": H,
+        "score": score_z,
+        "notes": notes_z,
+    })
+
+    # Orientation 2: Side (X up — rotate 90° around Y)
+    base_area_x = D * H
+    score_x = 100
+    notes_x = []
+    if base_area_x > base_area_z:
+        score_x += 10
+        notes_x.append("✅ Maior área de contato com a cama")
+    elif base_area_x < base_area_z * 0.5:
+        score_x -= 20
+        notes_x.append("⚠ Área de base pequena — instável")
+    if has_holes_yz:
+        score_x += 10
+        notes_x.append("✅ Furos YZ imprimem sem suporte nesta orientação")
+    if W > max(D, H) * 3:
+        score_x -= 25
+        notes_x.append("⚠ Muito alto nesta orientação")
+    orientations.append({
+        "name": "Lado (X ↑, rotação 90° em Y)",
+        "rotation": [0, 90, 0],
+        "base_area_mm2": round(base_area_x, 1),
+        "height_mm": W,
+        "score": score_x,
+        "notes": notes_x,
+    })
+
+    # Orientation 3: Front (Y up — rotate -90° around X)
+    base_area_y = W * H
+    score_y = 100
+    notes_y = []
+    if base_area_y > base_area_z:
+        score_y += 10
+        notes_y.append("✅ Maior área de contato com a cama")
+    elif base_area_y < base_area_z * 0.5:
+        score_y -= 20
+        notes_y.append("⚠ Área de base pequena — instável")
+    if has_holes_xz:
+        score_y += 10
+        notes_y.append("✅ Furos XZ imprimem sem suporte nesta orientação")
+    if D > max(W, H) * 3:
+        score_y -= 25
+        notes_y.append("⚠ Muito alto nesta orientação")
+    orientations.append({
+        "name": "Frente (Y ↑, rotação -90° em X)",
+        "rotation": [-90, 0, 0],
+        "base_area_mm2": round(base_area_y, 1),
+        "height_mm": D,
+        "score": score_y,
+        "notes": notes_y,
+    })
+
+    orientations.sort(key=lambda o: o["score"], reverse=True)
+    best = orientations[0]
+
+    return {
+        "recommended": best,
+        "all_orientations": orientations,
+        "profile": profile,
+        "summary": (
+            f"🔄 Orientação recomendada: {best['name']} "
+            f"(score: {best['score']}, base: {best['base_area_mm2']}mm², "
+            f"altura: {best['height_mm']}mm)"
+        )
+    }
+
+
+# ──────────────────────────────────────────────
+# generate_assembly (v0.4.5)
+# ──────────────────────────────────────────────
+
+def generate_assembly_scad(config: dict) -> tuple:
+    """
+    Gera projeto multi-peça com posicionamento e BOM automático.
+    Retorna (scad_assembly, piece_scads_dict, bom_markdown).
+    """
+    pieces = config.get("pieces", [])
+    project_name = config.get("project_name", "assembly")
+    explode_distance = max(0, config.get("explode_distance", 20))
+
+    if not pieces:
+        pieces = [
+            {"name": "base", "type": "box", "w": 80, "d": 60, "h": 3,
+             "color": [0.9, 0.8, 0.6]},
+            {"name": "wall_front", "type": "box", "w": 80, "d": 3, "h": 30,
+             "translate": [0, 0, 3], "color": [0.8, 0.6, 0.4]},
+            {"name": "wall_back", "type": "box", "w": 80, "d": 3, "h": 30,
+             "translate": [0, 57, 3], "color": [0.8, 0.5, 0.4]},
+            {"name": "wall_left", "type": "box", "w": 3, "d": 54, "h": 30,
+             "translate": [0, 3, 3], "color": [0.7, 0.5, 0.5]},
+            {"name": "wall_right", "type": "box", "w": 3, "d": 54, "h": 30,
+             "translate": [77, 3, 3], "color": [0.7, 0.4, 0.6]},
+        ]
+
+    piece_modules = []
+    piece_positions = []
+    bom_rows = []
+
+    for i, p in enumerate(pieces):
+        name = p.get("name", f"piece_{i}")
+        ptype = p.get("type", "box")
+        w = p.get("w", 10)
+        d = p.get("d", 10)
+        h = p.get("h", 10)
+        translate = p.get("translate", [0, 0, 0])
+        rotate_val = p.get("rotate", [0, 0, 0])
+        color = p.get("color", [0.8, 0.8, 0.8])
+        material = p.get("material", "PLA")
+        qty = p.get("qty", 1)
+
+        if ptype == "cylinder":
+            shape = f"cylinder(d={w}, h={h}, $fn=64)"
+        elif ptype == "custom":
+            shape = p.get("scad", "cube([10,10,10])")
+        else:
+            shape = f"cube([{w}, {d}, {h}])"
+
+        safe_name = name.replace(' ', '_').replace('-', '_')
+        module_name = f"piece_{safe_name}"
+        piece_modules.append(f"module {module_name}() {{\n    {shape};\n}}")
+
+        piece_positions.append({
+            "module": module_name,
+            "translate": translate,
+            "rotate": rotate_val,
+            "color": color,
+            "name": name,
+        })
+
+        vol_mm3 = w * d * h
+        bom_rows.append({
+            "name": name, "type": ptype,
+            "dimensions": f"{w}×{d}×{h}mm",
+            "material": material, "qty": qty,
+            "volume_cm3": round(vol_mm3 / 1000, 2),
+        })
+
+    # Assembly SCAD
+    scad = f"""// ============================================================
+// Assembly — {project_name}
+// Gerado pelo MCP-OpenSCAD
+// Peças: {len(pieces)}
+// ============================================================
+$fn = 64;
+
+"""
+    for mod in piece_modules:
+        scad += mod + "\n\n"
+
+    # Assembled module
+    scad += "module assembled() {\n"
+    for pp in piece_positions:
+        tx, ty, tz = pp["translate"]
+        rx, ry, rz = pp["rotate"]
+        r, g, b = pp["color"][0], pp["color"][1], pp["color"][2]
+        scad += f"    // {pp['name']}\n"
+        scad += f"    color([{r}, {g}, {b}])\n"
+        scad += f"        translate([{tx}, {ty}, {tz}])\n"
+        scad += f"            rotate([{rx}, {ry}, {rz}])\n"
+        scad += f"                {pp['module']}();\n"
+    scad += "}\n\n"
+
+    # Exploded module
+    scad += "module exploded() {\n"
+    for j, pp in enumerate(piece_positions):
+        tx, ty, tz = pp["translate"]
+        rx, ry, rz = pp["rotate"]
+        r, g, b = pp["color"][0], pp["color"][1], pp["color"][2]
+        ex = j * explode_distance
+        scad += f"    // {pp['name']} (exploded)\n"
+        scad += f"    color([{r}, {g}, {b}])\n"
+        scad += f"        translate([{tx}, {ty}, {tz + ex}])\n"
+        scad += f"            rotate([{rx}, {ry}, {rz}])\n"
+        scad += f"                {pp['module']}();\n"
+    scad += "}\n\n"
+
+    scad += """SHOW_EXPLODED = false;
+if (SHOW_EXPLODED) {
+    exploded();
+} else {
+    assembled();
+}
+"""
+
+    # Individual piece SCADs
+    piece_scads = {}
+    for pp, mod in zip(piece_positions, piece_modules):
+        piece_scads[pp["name"]] = f"// Peça: {pp['name']}\n$fn = 64;\n\n{mod}\n\n{pp['module']}();\n"
+
+    # BOM markdown
+    bom_md = f"# BOM — {project_name}\n\n"
+    bom_md += "| # | Peça | Tipo | Dimensões | Material | Qtd | Volume |\n"
+    bom_md += "|---|------|------|-----------|----------|-----|--------|\n"
+    total_vol = 0
+    for i, row in enumerate(bom_rows):
+        bom_md += (f"| {i+1} | {row['name']} | {row['type']} | "
+                   f"{row['dimensions']} | {row['material']} | "
+                   f"{row['qty']} | {row['volume_cm3']} cm³ |\n")
+        total_vol += row["volume_cm3"] * row["qty"]
+    bom_md += f"\n**Volume total:** {total_vol:.2f} cm³\n"
+    bom_md += f"**Peças:** {sum(r['qty'] for r in bom_rows)}\n"
+
+    return scad, piece_scads, bom_md
 
 
 # ──────────────────────────────────────────────
@@ -1501,6 +2231,166 @@ async def handle_list_tools() -> list:
                     }
                 },
                 "required": ["config"]
+            }
+        ),
+        # 3D printing test plates (v0.4.0)
+        types.Tool(
+            name="generate_tolerance_test",
+            description=(
+                "Gera placa de teste de tolerância para calibração de impressão 3D. "
+                "Pares de pinos macho e furos fêmea com tolerâncias variadas. "
+                "Exporta SCAD + STL + preview PNG."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "config": {
+                        "type": "object",
+                        "description": (
+                            "base_width, base_depth, base_height, pin_height, pin_d, hole_d, "
+                            "tol_min, tol_max, tol_step, gap"
+                        )
+                    },
+                    "output_dir": {"type": "string"},
+                    "project_name": {"type": "string"}
+                },
+                "required": ["output_dir", "project_name"]
+            }
+        ),
+        types.Tool(
+            name="generate_bed_level_test",
+            description=(
+                "Gera padrão de teste de nivelamento de mesa para impressão 3D. "
+                "Grade de discos finos distribuídos pela área da mesa. "
+                "Exporta SCAD + STL + preview PNG."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "config": {
+                        "type": "object",
+                        "description": (
+                            "bed_x, bed_y, disc_d, disc_h, grid_cols, grid_rows, skirt_w"
+                        )
+                    },
+                    "output_dir": {"type": "string"},
+                    "project_name": {"type": "string"}
+                },
+                "required": ["output_dir", "project_name"]
+            }
+        ),
+        types.Tool(
+            name="generate_retraction_test",
+            description=(
+                "Gera torre de teste de retração/stringing para impressão 3D. "
+                "Cilindros finos espaçados em base comum. Stringing entre torres "
+                "indica retração insuficiente. Exporta SCAD + STL + preview PNG."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "config": {
+                        "type": "object",
+                        "description": (
+                            "tower_d, tower_h, tower_count, tower_gap, base_h, base_pad"
+                        )
+                    },
+                    "output_dir": {"type": "string"},
+                    "project_name": {"type": "string"}
+                },
+                "required": ["output_dir", "project_name"]
+            }
+        ),
+        # Laser decoration / CNC tools
+        types.Tool(
+            name="generate_living_hinge",
+            description=(
+                "Gera padrão de living hinge para corte a laser. "
+                "Padrões: straight (cortes paralelos alternados), serpentine (zigzag), cross (cross-hatch). "
+                "Saída 2D para exportação SVG + DXF + preview PNG."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "config": {
+                        "type": "object",
+                        "description": (
+                            "width, height, material_thickness, kerf, "
+                            "pattern (straight|serpentine|cross), "
+                            "cut_length, cut_gap, row_spacing, margin"
+                        )
+                    },
+                    "output_dir": {"type": "string"},
+                    "project_name": {"type": "string"}
+                },
+                "required": ["output_dir", "project_name"]
+            }
+        ),
+        types.Tool(
+            name="generate_dogbone",
+            description=(
+                "Gera pocket retangular com compensação dogbone ou T-bone nos cantos para CNC. "
+                "Compensa cantos internos para fresas cilíndricas. "
+                "Inclui layout de teste com múltiplos tamanhos. Exporta SVG + DXF + preview PNG."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "config": {
+                        "type": "object",
+                        "description": (
+                            "width, height, depth, tool_d (diâmetro da fresa, default 3.175mm = 1/8\"), "
+                            "corner_style (dogbone|tbone_h|tbone_v), material_thickness"
+                        )
+                    },
+                    "output_dir": {"type": "string"},
+                    "project_name": {"type": "string"}
+                },
+                "required": ["output_dir", "project_name"]
+            }
+        ),
+        # Orientação + Assembly
+        types.Tool(
+            name="suggest_orientation",
+            description=(
+                "Sugere a melhor orientação de impressão 3D com base nas dimensões e furos. "
+                "Analisa 3 orientações e retorna score, área de base e notas."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "config": {
+                        "type": "object",
+                        "description": (
+                            "width, depth, height, has_holes_xy, has_holes_xz, has_holes_yz, "
+                            "has_flat_bottom, detail_on_top, profile (fdm_standard|fdm_fine|resin)"
+                        )
+                    }
+                },
+                "required": ["config"]
+            }
+        ),
+        types.Tool(
+            name="generate_assembly",
+            description=(
+                "Gera projeto multi-peça com posicionamento, vista explodida e BOM automático. "
+                "Cada peça é definida com tipo (box/cylinder/custom), posição, rotação e cor. "
+                "Exporta SCAD assembly + peças individuais + BOM em Markdown."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "config": {
+                        "type": "object",
+                        "description": (
+                            "pieces (array: name, type, w, d, h, translate, rotate, color, material, qty), "
+                            "project_name, explode_distance"
+                        )
+                    },
+                    "output_dir": {"type": "string"},
+                    "project_name": {"type": "string"}
+                },
+                "required": ["output_dir", "project_name"]
             }
         ),
     ]
@@ -1846,6 +2736,76 @@ async def handle_call_tool(
             results.append(f"❌ Erro PNG: {e}")
             return [types.TextContent(type="text", text="\n".join(results))]
 
+    elif name == "generate_living_hinge":
+        if not arguments:
+            raise ValueError("Missing arguments")
+        config       = arguments.get("config", {})
+        output_dir   = arguments.get("output_dir", "/tmp")
+        project_name = arguments.get("project_name", "living_hinge")
+        os.makedirs(output_dir, exist_ok=True)
+
+        scad_code = generate_living_hinge_scad(config)
+        scad_path = os.path.join(output_dir, f"{project_name}.scad")
+        with open(scad_path, "w") as f:
+            f.write(scad_code)
+
+        results = [f"🔗 Living hinge gerado: {scad_path}"]
+        for fmt, label in [("svg", "🖼 SVG"), ("dxf", "📐 DXF")]:
+            try:
+                dst = os.path.join(output_dir, f"{project_name}.{fmt}")
+                p, _ = run_openscad(scad_code, fmt)
+                shutil.move(p, dst)
+                results.append(f"{label} gerado: {dst}")
+            except Exception as e:
+                results.append(f"❌ Erro {fmt.upper()}: {e}")
+
+        try:
+            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall", "--projection=ortho"])
+            with open(out_path, "rb") as f:
+                img_data = base64.b64encode(f.read()).decode("utf-8")
+            os.remove(out_path)
+            results.append("📷 Preview gerado.")
+            return [types.TextContent(type="text", text="\n".join(results)),
+                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
+        except Exception as e:
+            results.append(f"❌ Erro PNG: {e}")
+            return [types.TextContent(type="text", text="\n".join(results))]
+
+    elif name == "generate_dogbone":
+        if not arguments:
+            raise ValueError("Missing arguments")
+        config       = arguments.get("config", {})
+        output_dir   = arguments.get("output_dir", "/tmp")
+        project_name = arguments.get("project_name", "dogbone")
+        os.makedirs(output_dir, exist_ok=True)
+
+        scad_code = generate_dogbone_scad(config)
+        scad_path = os.path.join(output_dir, f"{project_name}.scad")
+        with open(scad_path, "w") as f:
+            f.write(scad_code)
+
+        results = [f"🦴 Dogbone pocket gerado: {scad_path}"]
+        for fmt, label in [("svg", "🖼 SVG"), ("dxf", "📐 DXF")]:
+            try:
+                dst = os.path.join(output_dir, f"{project_name}.{fmt}")
+                p, _ = run_openscad(scad_code, fmt)
+                shutil.move(p, dst)
+                results.append(f"{label} gerado: {dst}")
+            except Exception as e:
+                results.append(f"❌ Erro {fmt.upper()}: {e}")
+
+        try:
+            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall", "--projection=ortho"])
+            with open(out_path, "rb") as f:
+                img_data = base64.b64encode(f.read()).decode("utf-8")
+            os.remove(out_path)
+            results.append("📷 Preview gerado.")
+            return [types.TextContent(type="text", text="\n".join(results)),
+                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
+        except Exception as e:
+            results.append(f"❌ Erro PNG: {e}")
+            return [types.TextContent(type="text", text="\n".join(results))]
+
     elif name == "validate_printability":
         if not arguments or "config" not in arguments:
             raise ValueError("Missing 'config'")
@@ -1868,6 +2828,173 @@ async def handle_call_tool(
             lines.extend(f"  {i}" for i in r["info"])
         return [types.TextContent(type="text", text="\n".join(lines))]
 
+    elif name == "generate_tolerance_test":
+        if not arguments:
+            raise ValueError("Missing arguments")
+        config       = arguments.get("config", {})
+        output_dir   = arguments.get("output_dir", "/tmp")
+        project_name = arguments.get("project_name", "tolerance_test")
+        os.makedirs(output_dir, exist_ok=True)
+
+        scad_code = generate_tolerance_test_scad(config)
+        scad_path = os.path.join(output_dir, f"{project_name}.scad")
+        with open(scad_path, "w") as f:
+            f.write(scad_code)
+
+        results = [f"🔬 Placa de tolerância gerada: {scad_path}"]
+        try:
+            stl_path = os.path.join(output_dir, f"{project_name}.stl")
+            p, _ = run_openscad(scad_code, "stl")
+            shutil.move(p, stl_path)
+            results.append(f"📐 STL gerado: {stl_path}")
+        except Exception as e:
+            results.append(f"❌ Erro STL: {e}")
+
+        try:
+            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
+            with open(out_path, "rb") as f:
+                img_data = base64.b64encode(f.read()).decode("utf-8")
+            os.remove(out_path)
+            return [types.TextContent(type="text", text="\n".join(results)),
+                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
+        except Exception as e:
+            results.append(f"❌ Erro PNG: {e}")
+            return [types.TextContent(type="text", text="\n".join(results))]
+
+    elif name == "generate_bed_level_test":
+        if not arguments:
+            raise ValueError("Missing arguments")
+        config       = arguments.get("config", {})
+        output_dir   = arguments.get("output_dir", "/tmp")
+        project_name = arguments.get("project_name", "bed_level_test")
+        os.makedirs(output_dir, exist_ok=True)
+
+        scad_code = generate_bed_level_test_scad(config)
+        scad_path = os.path.join(output_dir, f"{project_name}.scad")
+        with open(scad_path, "w") as f:
+            f.write(scad_code)
+
+        results = [f"📏 Teste de nivelamento gerado: {scad_path}"]
+        try:
+            stl_path = os.path.join(output_dir, f"{project_name}.stl")
+            p, _ = run_openscad(scad_code, "stl")
+            shutil.move(p, stl_path)
+            results.append(f"📐 STL gerado: {stl_path}")
+        except Exception as e:
+            results.append(f"❌ Erro STL: {e}")
+
+        try:
+            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
+            with open(out_path, "rb") as f:
+                img_data = base64.b64encode(f.read()).decode("utf-8")
+            os.remove(out_path)
+            return [types.TextContent(type="text", text="\n".join(results)),
+                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
+        except Exception as e:
+            results.append(f"❌ Erro PNG: {e}")
+            return [types.TextContent(type="text", text="\n".join(results))]
+
+    elif name == "generate_retraction_test":
+        if not arguments:
+            raise ValueError("Missing arguments")
+        config       = arguments.get("config", {})
+        output_dir   = arguments.get("output_dir", "/tmp")
+        project_name = arguments.get("project_name", "retraction_test")
+        os.makedirs(output_dir, exist_ok=True)
+
+        scad_code = generate_retraction_test_scad(config)
+        scad_path = os.path.join(output_dir, f"{project_name}.scad")
+        with open(scad_path, "w") as f:
+            f.write(scad_code)
+
+        results = [f"🗼 Torre de retração gerada: {scad_path}"]
+        try:
+            stl_path = os.path.join(output_dir, f"{project_name}.stl")
+            p, _ = run_openscad(scad_code, "stl")
+            shutil.move(p, stl_path)
+            results.append(f"📐 STL gerado: {stl_path}")
+        except Exception as e:
+            results.append(f"❌ Erro STL: {e}")
+
+        try:
+            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
+            with open(out_path, "rb") as f:
+                img_data = base64.b64encode(f.read()).decode("utf-8")
+            os.remove(out_path)
+            return [types.TextContent(type="text", text="\n".join(results)),
+                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
+        except Exception as e:
+            results.append(f"❌ Erro PNG: {e}")
+            return [types.TextContent(type="text", text="\n".join(results))]
+
+    elif name == "suggest_orientation":
+        if not arguments or "config" not in arguments:
+            raise ValueError("Missing 'config'")
+        r = suggest_orientation(arguments["config"])
+        lines = [r["summary"], ""]
+        for o in r["all_orientations"]:
+            marker = "👉 " if o == r["recommended"] else "   "
+            lines.append(f"{marker}{o['name']} — score: {o['score']}")
+            lines.append(f"      Base: {o['base_area_mm2']}mm² | Altura: {o['height_mm']}mm")
+            for n in o["notes"]:
+                lines.append(f"      {n}")
+            lines.append("")
+        return [types.TextContent(type="text", text="\n".join(lines))]
+
+    elif name == "generate_assembly":
+        if not arguments:
+            raise ValueError("Missing arguments")
+        config       = arguments.get("config", {})
+        output_dir   = arguments.get("output_dir", "/tmp")
+        project_name = arguments.get("project_name", "assembly")
+        os.makedirs(output_dir, exist_ok=True)
+
+        scad_assembly, piece_scads, bom_md = generate_assembly_scad(config)
+
+        # Save assembly SCAD
+        scad_path = os.path.join(output_dir, f"{project_name}.scad")
+        with open(scad_path, "w") as f:
+            f.write(scad_assembly)
+
+        results = [f"🏗 Assembly gerado: {scad_path}"]
+
+        # Save individual pieces
+        pieces_dir = os.path.join(output_dir, "pieces")
+        os.makedirs(pieces_dir, exist_ok=True)
+        for pname, pscad in piece_scads.items():
+            ppath = os.path.join(pieces_dir, f"{pname}.scad")
+            with open(ppath, "w") as f:
+                f.write(pscad)
+            results.append(f"  📦 Peça: {ppath}")
+
+        # Save BOM
+        bom_path = os.path.join(output_dir, f"{project_name}_bom.md")
+        with open(bom_path, "w") as f:
+            f.write(bom_md)
+        results.append(f"📋 BOM: {bom_path}")
+
+        # Export STL
+        try:
+            stl_path = os.path.join(output_dir, f"{project_name}.stl")
+            p, _ = run_openscad(scad_assembly, "stl")
+            shutil.move(p, stl_path)
+            results.append(f"📐 STL assembly: {stl_path}")
+        except Exception as e:
+            results.append(f"❌ Erro STL: {e}")
+
+        # Preview PNG
+        try:
+            out_path, _ = run_openscad(scad_assembly, "png", ["--autocenter", "--viewall"])
+            with open(out_path, "rb") as f:
+                img_data = base64.b64encode(f.read()).decode("utf-8")
+            os.remove(out_path)
+            results.append("📷 Preview gerado.")
+            return [types.TextContent(type="text", text="\n".join(results)),
+                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
+        except Exception as e:
+            results.append(f"❌ Erro PNG: {e}")
+            return [types.TextContent(type="text", text="\n".join(results))]
+
     else:
         raise ValueError(f"Unknown tool: {name}")
 
@@ -1879,7 +3006,7 @@ async def main():
             write_stream,
             InitializationOptions(
                 server_name="mcp-openscad",
-                server_version="0.3.0",
+                server_version="0.4.0",
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},

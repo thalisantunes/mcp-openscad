@@ -522,7 +522,16 @@ async def test_handle_list_tools():
     assert "generate_bracket"        in tool_names
     assert "generate_enclosure"      in tool_names
     assert "validate_printability"   in tool_names
-    assert len(tools) == 16
+    assert "generate_tolerance_test"  in tool_names
+    assert "generate_bed_level_test"  in tool_names
+    assert "generate_retraction_test" in tool_names
+    # Laser decoration / CNC
+    assert "generate_living_hinge"     in tool_names
+    assert "generate_dogbone"          in tool_names
+    # Orientation + Assembly
+    assert "suggest_orientation"        in tool_names
+    assert "generate_assembly"          in tool_names
+    assert len(tools) == 23
 
 
 @pytest.mark.asyncio
@@ -1090,3 +1099,630 @@ async def test_handle_call_tool_export_stl_failure():
     })
     assert len(result) >= 1
     assert result[0].type == "text"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# generate_tolerance_test_scad
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_generate_tolerance_test_basic():
+    """Basic: gera placa de tolerância com defaults."""
+    cfg = {}
+    scad = server.generate_tolerance_test_scad(cfg)
+    assert "cylinder" in scad
+    assert "Tolerância" in scad or "Toler" in scad
+    assert "difference" in scad
+    assert "text" in scad
+    assert "linear_extrude" in scad
+
+
+def test_generate_tolerance_test_custom_range():
+    """Custom: tolerância de -0.1 a 0.1 com passo 0.1 = 3 pares."""
+    cfg = {"tol_min": -0.1, "tol_max": 0.1, "tol_step": 0.1}
+    scad = server.generate_tolerance_test_scad(cfg)
+    assert scad.count("Pino macho") == 3
+    assert scad.count("Furo fêmea") == 3
+
+
+def test_generate_tolerance_test_step_zero_guard():
+    """Guard: tol_step=0 deve usar fallback 0.1."""
+    cfg = {"tol_min": 0.0, "tol_max": 0.2, "tol_step": 0}
+    scad = server.generate_tolerance_test_scad(cfg)
+    assert "cylinder" in scad
+
+
+def test_generate_tolerance_test_step_negative_guard():
+    """Guard: tol_step negativo deve usar fallback 0.1."""
+    cfg = {"tol_min": -0.1, "tol_max": 0.1, "tol_step": -0.05}
+    scad = server.generate_tolerance_test_scad(cfg)
+    assert "cylinder" in scad
+
+
+def test_generate_tolerance_test_single_value():
+    """Edge: tol_min == tol_max = 1 par apenas."""
+    cfg = {"tol_min": 0.0, "tol_max": 0.0, "tol_step": 0.1}
+    scad = server.generate_tolerance_test_scad(cfg)
+    assert scad.count("Pino macho") == 1
+    assert scad.count("Furo fêmea") == 1
+
+
+def test_generate_tolerance_test_empty_config():
+    """Edge: config vazio deve usar defaults."""
+    scad = server.generate_tolerance_test_scad({})
+    assert "$fn" in scad
+    assert "cube" in scad
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_generate_tolerance_test(tmp_path):
+    """Handler: generate_tolerance_test gera SCAD + STL."""
+    result = await server.handle_call_tool("generate_tolerance_test", {
+        "config": {"tol_min": -0.1, "tol_max": 0.1, "tol_step": 0.1},
+        "output_dir": str(tmp_path),
+        "project_name": "tol_test"
+    })
+    assert os.path.exists(str(tmp_path / "tol_test.scad"))
+    assert len(result) >= 1
+    assert "tol_test" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_generate_tolerance_test_missing_args():
+    """Handler: generate_tolerance_test sem args."""
+    with pytest.raises(ValueError, match="Missing arguments"):
+        await server.handle_call_tool("generate_tolerance_test", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# generate_bed_level_test_scad
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_generate_bed_level_test_basic():
+    """Basic: gera padrão de nivelamento com defaults."""
+    cfg = {}
+    scad = server.generate_bed_level_test_scad(cfg)
+    assert "cylinder" in scad
+    assert "Nivelamento" in scad or "Disco" in scad
+    # Default: 5x5 = 25 discos
+    assert scad.count("Disco [") == 25
+
+
+def test_generate_bed_level_test_custom_grid():
+    """Custom: 3x2 grid = 6 discos."""
+    cfg = {"grid_cols": 3, "grid_rows": 2, "bed_x": 200, "bed_y": 200}
+    scad = server.generate_bed_level_test_scad(cfg)
+    assert scad.count("Disco [") == 6
+
+
+def test_generate_bed_level_test_no_skirt():
+    """Edge: skirt_w=0 gera discos sem saia."""
+    cfg = {"grid_cols": 2, "grid_rows": 2, "skirt_w": 0}
+    scad = server.generate_bed_level_test_scad(cfg)
+    assert "difference" not in scad
+    assert "cylinder" in scad
+
+
+def test_generate_bed_level_test_single_disc():
+    """Edge: 1x1 grid = 1 disco centralizado."""
+    cfg = {"grid_cols": 1, "grid_rows": 1}
+    scad = server.generate_bed_level_test_scad(cfg)
+    assert scad.count("Disco [") == 1
+
+
+def test_generate_bed_level_test_empty_config():
+    """Edge: config vazio deve usar defaults."""
+    scad = server.generate_bed_level_test_scad({})
+    assert "$fn" in scad
+    assert "cylinder" in scad
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_generate_bed_level_test(tmp_path):
+    """Handler: generate_bed_level_test gera SCAD + STL."""
+    result = await server.handle_call_tool("generate_bed_level_test", {
+        "config": {"grid_cols": 2, "grid_rows": 2, "bed_x": 100, "bed_y": 100},
+        "output_dir": str(tmp_path),
+        "project_name": "bed_test"
+    })
+    assert os.path.exists(str(tmp_path / "bed_test.scad"))
+    assert len(result) >= 1
+    assert "bed_test" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_generate_bed_level_test_missing_args():
+    """Handler: generate_bed_level_test sem args."""
+    with pytest.raises(ValueError, match="Missing arguments"):
+        await server.handle_call_tool("generate_bed_level_test", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# generate_retraction_test_scad
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_generate_retraction_test_basic():
+    """Basic: gera torre de retração com defaults."""
+    cfg = {}
+    scad = server.generate_retraction_test_scad(cfg)
+    assert "cylinder" in scad
+    assert "cube" in scad
+    assert "Retração" in scad or "Torre" in scad
+    # Default: 5 torres
+    assert scad.count("Torre ") >= 5
+
+
+def test_generate_retraction_test_custom_count():
+    """Custom: 3 torres."""
+    cfg = {"tower_count": 3}
+    scad = server.generate_retraction_test_scad(cfg)
+    # 3 torre comments (Torre 1, Torre 2, Torre 3)
+    for i in range(1, 4):
+        assert f"Torre {i}" in scad
+
+
+def test_generate_retraction_test_single_tower():
+    """Edge: tower_count=1 deve gerar 1 torre."""
+    cfg = {"tower_count": 1}
+    scad = server.generate_retraction_test_scad(cfg)
+    assert scad.count("cylinder") == 1
+
+
+def test_generate_retraction_test_zero_tower_guard():
+    """Guard: tower_count=0 deve ser clamped a 1."""
+    cfg = {"tower_count": 0}
+    scad = server.generate_retraction_test_scad(cfg)
+    assert scad.count("cylinder") >= 1
+
+
+def test_generate_retraction_test_empty_config():
+    """Edge: config vazio deve usar defaults."""
+    scad = server.generate_retraction_test_scad({})
+    assert "$fn" in scad
+    assert "cube" in scad
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_generate_retraction_test(tmp_path):
+    """Handler: generate_retraction_test gera SCAD + STL."""
+    result = await server.handle_call_tool("generate_retraction_test", {
+        "config": {"tower_count": 3, "tower_h": 40},
+        "output_dir": str(tmp_path),
+        "project_name": "retract_test"
+    })
+    assert os.path.exists(str(tmp_path / "retract_test.scad"))
+    assert len(result) >= 1
+    assert "retract_test" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_generate_retraction_test_missing_args():
+    """Handler: generate_retraction_test sem args."""
+    with pytest.raises(ValueError, match="Missing arguments"):
+        await server.handle_call_tool("generate_retraction_test", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Integração OpenSCAD — novos geradores v0.4.0
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_openscad_renders_tolerance_test():
+    """Integração: gera placa de tolerância e renderiza STL."""
+    cfg = {"tol_min": 0.0, "tol_max": 0.1, "tol_step": 0.1}
+    scad = server.generate_tolerance_test_scad(cfg)
+    out_path, _ = server.run_openscad(scad, "stl")
+    assert os.path.exists(out_path)
+    assert os.path.getsize(out_path) > 100
+    os.remove(out_path)
+
+
+def test_openscad_renders_bed_level_test():
+    """Integração: gera teste de nivelamento e renderiza STL."""
+    cfg = {"grid_cols": 2, "grid_rows": 2, "bed_x": 100, "bed_y": 100}
+    scad = server.generate_bed_level_test_scad(cfg)
+    out_path, _ = server.run_openscad(scad, "stl")
+    assert os.path.exists(out_path)
+    assert os.path.getsize(out_path) > 100
+    os.remove(out_path)
+
+
+def test_openscad_renders_retraction_test():
+    """Integração: gera torre de retração e renderiza STL."""
+    cfg = {"tower_count": 2, "tower_h": 20}
+    scad = server.generate_retraction_test_scad(cfg)
+    out_path, _ = server.run_openscad(scad, "stl")
+    assert os.path.exists(out_path)
+    assert os.path.getsize(out_path) > 100
+    os.remove(out_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# generate_living_hinge_scad
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_generate_living_hinge_straight_basic():
+    """Straight pattern: deve gerar difference() com cortes."""
+    cfg = {"width": 100, "height": 60, "pattern": "straight"}
+    scad = server.generate_living_hinge_scad(cfg)
+    assert "difference()" in scad
+    assert "square" in scad
+    assert "Living Hinge" in scad
+    assert "straight" in scad
+
+
+def test_generate_living_hinge_serpentine():
+    """Serpentine pattern: deve gerar cortes alternados."""
+    cfg = {"width": 100, "height": 60, "pattern": "serpentine"}
+    scad = server.generate_living_hinge_scad(cfg)
+    assert "difference()" in scad
+    assert "serpentine" in scad
+    assert "square" in scad
+
+
+def test_generate_living_hinge_cross():
+    """Cross pattern: deve gerar cortes em X e Y."""
+    cfg = {"width": 100, "height": 60, "pattern": "cross"}
+    scad = server.generate_living_hinge_scad(cfg)
+    assert "difference()" in scad
+    assert "cross-hatch" in scad
+    assert "square" in scad
+
+
+def test_generate_living_hinge_invalid_pattern_fallback():
+    """Padrão desconhecido deve usar 'straight' como fallback."""
+    cfg = {"width": 100, "height": 60, "pattern": "invalid_xyz"}
+    scad = server.generate_living_hinge_scad(cfg)
+    assert "straight" in scad
+
+
+def test_generate_living_hinge_small_inner_area():
+    """Guard: margem grande demais deve retornar retângulo simples."""
+    cfg = {"width": 20, "height": 20, "margin": 15, "cut_length": 15}
+    scad = server.generate_living_hinge_scad(cfg)
+    # Inner area too small, should just output a plain square
+    assert "insuficiente" in scad
+
+
+def test_generate_living_hinge_empty_config():
+    """Edge: config vazio deve usar defaults."""
+    scad = server.generate_living_hinge_scad({})
+    assert "Living Hinge" in scad
+    assert "difference()" in scad
+
+
+def test_generate_living_hinge_custom_params():
+    """Custom params: cut_length, cut_gap, row_spacing."""
+    cfg = {
+        "width": 80, "height": 50, "pattern": "straight",
+        "cut_length": 10, "cut_gap": 3, "row_spacing": 4, "margin": 3
+    }
+    scad = server.generate_living_hinge_scad(cfg)
+    assert "80" in scad and "50" in scad
+    assert "difference()" in scad
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_generate_living_hinge(tmp_path):
+    """Handler: generate_living_hinge gera SCAD + SVG + DXF."""
+    result = await server.handle_call_tool("generate_living_hinge", {
+        "config": {"width": 80, "height": 50, "pattern": "straight"},
+        "output_dir": str(tmp_path),
+        "project_name": "hinge_test"
+    })
+    assert os.path.exists(str(tmp_path / "hinge_test.scad"))
+    assert len(result) >= 1
+    assert "hinge_test" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_generate_living_hinge_missing_args():
+    """Handler: generate_living_hinge sem args."""
+    with pytest.raises(ValueError, match="Missing arguments"):
+        await server.handle_call_tool("generate_living_hinge", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# generate_dogbone_scad
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_generate_dogbone_basic():
+    """Dogbone: deve gerar módulos com circles nos cantos."""
+    cfg = {"width": 50, "height": 30}
+    scad = server.generate_dogbone_scad(cfg)
+    assert "module main_pocket" in scad
+    assert "circle" in scad
+    assert "dogbone" in scad.lower()
+    assert "square" in scad
+
+
+def test_generate_dogbone_tbone_h():
+    """T-bone horizontal: deve gerar compensação horizontal."""
+    cfg = {"width": 50, "height": 30, "corner_style": "tbone_h"}
+    scad = server.generate_dogbone_scad(cfg)
+    assert "tbone_h" in scad
+    assert "circle" in scad
+
+
+def test_generate_dogbone_tbone_v():
+    """T-bone vertical: deve gerar compensação vertical."""
+    cfg = {"width": 50, "height": 30, "corner_style": "tbone_v"}
+    scad = server.generate_dogbone_scad(cfg)
+    assert "tbone_v" in scad
+    assert "circle" in scad
+
+
+def test_generate_dogbone_invalid_style_fallback():
+    """Estilo desconhecido deve usar 'dogbone' como fallback."""
+    cfg = {"width": 50, "height": 30, "corner_style": "invalid"}
+    scad = server.generate_dogbone_scad(cfg)
+    assert "dogbone" in scad.lower()
+
+
+def test_generate_dogbone_test_layout():
+    """Deve gerar layout de teste com múltiplos pocket sizes."""
+    cfg = {"width": 50, "height": 30}
+    scad = server.generate_dogbone_scad(cfg)
+    assert "test_layout" in scad
+    assert "pocket_full_size" in scad
+    assert "pocket_size_75pct" in scad
+    assert "pocket_size_50pct" in scad
+
+
+def test_generate_dogbone_custom_tool():
+    """Custom tool diameter."""
+    cfg = {"width": 50, "height": 30, "tool_d": 6.35}
+    scad = server.generate_dogbone_scad(cfg)
+    assert "6.35" in scad
+    assert "circle" in scad
+
+
+def test_generate_dogbone_empty_config():
+    """Edge: config vazio deve usar defaults."""
+    scad = server.generate_dogbone_scad({})
+    assert "module main_pocket" in scad
+    assert "3.175" in scad  # default tool_d
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_generate_dogbone(tmp_path):
+    """Handler: generate_dogbone gera SCAD + SVG + DXF."""
+    result = await server.handle_call_tool("generate_dogbone", {
+        "config": {"width": 50, "height": 30, "corner_style": "dogbone"},
+        "output_dir": str(tmp_path),
+        "project_name": "dogbone_test"
+    })
+    assert os.path.exists(str(tmp_path / "dogbone_test.scad"))
+    assert len(result) >= 1
+    assert "dogbone_test" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_generate_dogbone_missing_args():
+    """Handler: generate_dogbone sem args."""
+    with pytest.raises(ValueError, match="Missing arguments"):
+        await server.handle_call_tool("generate_dogbone", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Integração OpenSCAD — living hinge + dogbone
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_openscad_renders_living_hinge_svg():
+    """Integração: gera living hinge e exporta SVG."""
+    cfg = {"width": 80, "height": 50, "pattern": "straight"}
+    scad = server.generate_living_hinge_scad(cfg)
+    out_path, _ = server.run_openscad(scad, "svg")
+    assert os.path.exists(out_path)
+    assert os.path.getsize(out_path) > 100
+    os.remove(out_path)
+
+
+def test_openscad_renders_dogbone_svg():
+    """Integração: gera dogbone pocket e exporta SVG."""
+    cfg = {"width": 50, "height": 30, "corner_style": "dogbone"}
+    scad = server.generate_dogbone_scad(cfg)
+    out_path, _ = server.run_openscad(scad, "svg")
+    assert os.path.exists(out_path)
+    assert os.path.getsize(out_path) > 100
+    os.remove(out_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# suggest_orientation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_suggest_orientation_basic():
+    """Basic: peça com base plana, orientação Z deve ser recomendada."""
+    cfg = {"width": 80, "depth": 60, "height": 40, "has_flat_bottom": True}
+    r = server.suggest_orientation(cfg)
+    assert "recommended" in r
+    assert "all_orientations" in r
+    assert len(r["all_orientations"]) == 3
+    assert r["recommended"]["score"] >= 100
+    assert "summary" in r
+
+
+def test_suggest_orientation_tall_piece():
+    """Peça muito alta: penalidade na orientação Z."""
+    cfg = {"width": 20, "depth": 20, "height": 200, "has_flat_bottom": True}
+    r = server.suggest_orientation(cfg)
+    z_orient = [o for o in r["all_orientations"] if o["rotation"] == [0, 0, 0]][0]
+    assert any("tombar" in n for n in z_orient["notes"])
+
+
+def test_suggest_orientation_holes_yz():
+    """Furos YZ: orientação X deve ganhar bônus."""
+    cfg = {"width": 80, "depth": 60, "height": 40, "has_holes_yz": True}
+    r = server.suggest_orientation(cfg)
+    x_orient = [o for o in r["all_orientations"] if o["rotation"] == [0, 90, 0]][0]
+    assert any("YZ" in n for n in x_orient["notes"])
+
+
+def test_suggest_orientation_flat_piece():
+    """Peça plana (grande base, baixa): Z deve ser ideal."""
+    cfg = {"width": 200, "depth": 150, "height": 5, "has_flat_bottom": True}
+    r = server.suggest_orientation(cfg)
+    assert r["recommended"]["rotation"] == [0, 0, 0]
+
+
+def test_suggest_orientation_with_detail():
+    """Detail on top: bônus na orientação Z."""
+    cfg = {"width": 80, "depth": 60, "height": 40, "detail_on_top": True}
+    r = server.suggest_orientation(cfg)
+    z_orient = [o for o in r["all_orientations"] if o["rotation"] == [0, 0, 0]][0]
+    assert any("Detalhes" in n for n in z_orient["notes"])
+
+
+def test_suggest_orientation_unknown_profile():
+    """Perfil desconhecido: usa fdm_standard."""
+    cfg = {"width": 80, "depth": 60, "height": 40, "profile": "xyz_unknown"}
+    r = server.suggest_orientation(cfg)
+    assert r["profile"] == "xyz_unknown"
+    assert len(r["all_orientations"]) == 3
+
+
+def test_suggest_orientation_empty_config():
+    """Config vazio: usa defaults."""
+    r = server.suggest_orientation({})
+    assert len(r["all_orientations"]) == 3
+    assert "recommended" in r
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_suggest_orientation():
+    """Handler: suggest_orientation retorna texto."""
+    result = await server.handle_call_tool("suggest_orientation", {
+        "config": {"width": 80, "depth": 60, "height": 40}
+    })
+    assert len(result) >= 1
+    assert "Orientação" in result[0].text or "score" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_suggest_orientation_missing_config():
+    """Handler: suggest_orientation sem config."""
+    with pytest.raises(ValueError, match="Missing"):
+        await server.handle_call_tool("suggest_orientation", {})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# generate_assembly
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_generate_assembly_default():
+    """Default: gera assembly com 5 peças exemplo."""
+    scad, pieces, bom = server.generate_assembly_scad({})
+    assert "assembled()" in scad
+    assert "exploded()" in scad
+    assert "SHOW_EXPLODED" in scad
+    assert len(pieces) == 5
+    assert "base" in pieces
+    assert "# BOM" in bom
+    assert "Volume total" in bom
+
+
+def test_generate_assembly_custom_pieces():
+    """Custom: 2 peças personalizadas."""
+    cfg = {
+        "project_name": "test_proj",
+        "pieces": [
+            {"name": "placa", "type": "box", "w": 50, "d": 30, "h": 2},
+            {"name": "pilar", "type": "cylinder", "w": 10, "h": 20,
+             "translate": [25, 15, 2], "material": "PETG"},
+        ]
+    }
+    scad, pieces, bom = server.generate_assembly_scad(cfg)
+    assert len(pieces) == 2
+    assert "placa" in pieces
+    assert "pilar" in pieces
+    assert "cylinder" in pieces["pilar"]
+    assert "PETG" in bom
+
+
+def test_generate_assembly_custom_scad():
+    """Custom SCAD: peça com código personalizado."""
+    cfg = {
+        "pieces": [
+            {"name": "custom_gear", "type": "custom",
+             "scad": "sphere(r=15)", "w": 30, "d": 30, "h": 30}
+        ]
+    }
+    scad, pieces, bom = server.generate_assembly_scad(cfg)
+    assert "sphere(r=15)" in scad
+    assert "sphere(r=15)" in pieces["custom_gear"]
+
+
+def test_generate_assembly_bom_format():
+    """BOM: formato correto com tabela markdown."""
+    cfg = {
+        "pieces": [
+            {"name": "a", "w": 10, "d": 20, "h": 30, "qty": 2},
+            {"name": "b", "w": 5, "d": 5, "h": 5, "qty": 4},
+        ]
+    }
+    _, _, bom = server.generate_assembly_scad(cfg)
+    assert "| 1 |" in bom
+    assert "| 2 |" in bom
+    assert "10×20×30mm" in bom
+    assert "**Peças:** 6" in bom
+
+
+def test_generate_assembly_explode_distance():
+    """Explode distance configurável."""
+    cfg = {"explode_distance": 50}
+    scad, _, _ = server.generate_assembly_scad(cfg)
+    assert "exploded()" in scad
+
+
+def test_generate_assembly_empty_config():
+    """Config vazio: usa assembly padrão."""
+    scad, pieces, bom = server.generate_assembly_scad({})
+    assert len(pieces) == 5
+    assert "assembled" in scad
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_generate_assembly(tmp_path):
+    """Handler: generate_assembly gera SCAD + STL + BOM."""
+    result = await server.handle_call_tool("generate_assembly", {
+        "config": {
+            "pieces": [
+                {"name": "base", "w": 40, "d": 30, "h": 3},
+                {"name": "wall", "w": 40, "d": 2, "h": 20, "translate": [0, 0, 3]},
+            ]
+        },
+        "output_dir": str(tmp_path),
+        "project_name": "test_asm"
+    })
+    assert os.path.exists(str(tmp_path / "test_asm.scad"))
+    assert os.path.exists(str(tmp_path / "test_asm_bom.md"))
+    assert os.path.exists(str(tmp_path / "pieces" / "base.scad"))
+    assert os.path.exists(str(tmp_path / "pieces" / "wall.scad"))
+    assert len(result) >= 1
+
+
+@pytest.mark.asyncio
+async def test_generate_assembly_missing_args():
+    """Handler: generate_assembly sem args."""
+    with pytest.raises(ValueError, match="Missing arguments"):
+        await server.handle_call_tool("generate_assembly", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Integração: suggest_orientation + assembly
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_openscad_renders_assembly():
+    """Integração: assembly gera SCAD válido que renderiza em STL."""
+    cfg = {
+        "pieces": [
+            {"name": "base", "w": 50, "d": 40, "h": 3},
+            {"name": "column", "type": "cylinder", "w": 8, "h": 25,
+             "translate": [25, 20, 3]},
+        ]
+    }
+    scad, _, _ = server.generate_assembly_scad(cfg)
+    out_path, _ = server.run_openscad(scad, "stl")
+    assert os.path.exists(out_path)
+    assert os.path.getsize(out_path) > 100
+    os.remove(out_path)
+
