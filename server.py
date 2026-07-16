@@ -13,9 +13,353 @@ import mcp.server.stdio
 server = Server("mcp-openscad")
 
 # ──────────────────────────────────────────────
+# Diretivas de Segurança e Sanitização de Caminhos
+# ──────────────────────────────────────────────
+BANNED_KEYWORDS = [
+    "firearm", "gun", "pistol", "rifle", "silencer", "receiver", "trigger",
+    "bullet", "explosive", "grenade", "bomb", "missile", "rocket body", "rocket_body",
+    "propellant", "combustion chamber", "combustion_chamber"
+]
+
+def verify_safety_guidelines(scad_code: str, project_name: str = ""):
+    text = f"{scad_code} {project_name}".lower()
+    if "nozzle" in text and ("rocket" in text or "propellant" in text or "thruster" in text):
+        raise ValueError("Safety violation: Generation of rocket nozzles/propellants is prohibited.")
+    for b in BANNED_KEYWORDS:
+        if b in text:
+            raise ValueError(f"Safety violation: Prohibited keyword '{b}' detected.")
+
+def validate_output_path(path: str) -> str:
+    resolved = os.path.abspath(path)
+    allowed_prefixes = ["/home/thas", "/tmp", "/var/tmp"]
+    if not any(resolved.startswith(p) for p in allowed_prefixes):
+        raise ValueError(f"Access denied: Path '{resolved}' is outside allowed directories.")
+    return resolved
+
+def safe_output_path(output_dir: str, project_name: str) -> tuple[str, str]:
+    # Sanitize project_name to avoid traversal
+    safe_project_name = os.path.basename(project_name)
+    safe_project_name = safe_project_name.replace("..", "").replace("/", "").replace("\\", "")
+    if not safe_project_name or safe_project_name in (".", ".."):
+        safe_project_name = "project"
+    
+    # Clean output_dir
+    norm_dir = validate_output_path(output_dir)
+    return norm_dir, safe_project_name
+
+def validate_config_parameters(tool_name: str, config: dict) -> None:
+    if not isinstance(config, dict):
+        raise ValueError("Configuration must be a dictionary.")
+
+    # Helper to assert type and positivity
+    def assert_positive(name, val):
+        if val is None:
+            raise ValueError(f"Parameter '{name}' is missing.")
+        try:
+            num = float(val)
+        except (ValueError, TypeError):
+            raise ValueError(f"Parameter '{name}' must be numeric.")
+        if num <= 0:
+            raise ValueError(f"Parameter '{name}' must be strictly positive.")
+        return num
+
+    def assert_non_negative(name, val):
+        if val is None:
+            raise ValueError(f"Parameter '{name}' is missing.")
+        try:
+            num = float(val)
+        except (ValueError, TypeError):
+            raise ValueError(f"Parameter '{name}' must be numeric.")
+        if num < 0:
+            raise ValueError(f"Parameter '{name}' must be non-negative.")
+        return num
+
+    def assert_integer(name, val, min_val=1):
+        if val is None:
+            raise ValueError(f"Parameter '{name}' is missing.")
+        try:
+            num = int(val)
+        except (ValueError, TypeError):
+            raise ValueError(f"Parameter '{name}' must be an integer.")
+        if num < min_val:
+            raise ValueError(f"Parameter '{name}' must be at least {min_val}.")
+        return num
+
+    if tool_name == "generate_laser_part":
+        t = assert_positive("material_thickness", config.get("material_thickness", 3))
+        assert_non_negative("kerf", config.get("kerf", 0.2))
+        W = assert_positive("width", config.get("width", 100))
+        D = assert_positive("depth", config.get("depth", 100))
+        H = assert_positive("height", config.get("height", 80))
+        assert_integer("fingers", config.get("fingers", 5), 1)
+        if W <= 2 * t:
+            raise ValueError(f"Width ({W}mm) must be greater than twice the material thickness ({2*t}mm).")
+        if D <= 2 * t:
+            raise ValueError(f"Depth ({D}mm) must be greater than twice the material thickness ({2*t}mm).")
+
+        for op in config.get("openings", []):
+            if not isinstance(op, dict):
+                raise ValueError("Each opening must be a dictionary.")
+            wall = op.get("wall")
+            if wall not in ("front", "back", "left", "right"):
+                raise ValueError(f"Opening wall '{wall}' is invalid. Must be 'front', 'back', 'left', or 'right'.")
+            shape = op.get("shape", "rect")
+            if shape not in ("rect", "circle"):
+                raise ValueError(f"Opening shape '{shape}' is invalid. Must be 'rect' or 'circle'.")
+            if shape == "rect":
+                assert_non_negative("opening x", op.get("x", 0))
+                assert_non_negative("opening y", op.get("y", 0))
+                assert_positive("opening w", op.get("w", 30))
+                assert_positive("opening h", op.get("h", 40))
+            else:
+                assert_non_negative("opening cx", op.get("cx", 50))
+                assert_non_negative("opening cy", op.get("cy", 40))
+                assert_positive("opening d", op.get("d", 20))
+
+    elif tool_name == "generate_box":
+        t = assert_positive("material_thickness", config.get("material_thickness", 3))
+        assert_non_negative("kerf", config.get("kerf", 0.2))
+        W = assert_positive("width", config.get("width", 100))
+        D = assert_positive("depth", config.get("depth", 80))
+        H = assert_positive("height", config.get("height", 50))
+        assert_integer("fingers", config.get("fingers", 5), 1)
+        assert_non_negative("dividers_x", config.get("dividers_x", 0))
+        assert_non_negative("dividers_y", config.get("dividers_y", 0))
+        lid_type = config.get("lid_type", "snap")
+        if lid_type not in ("snap", "slide", "none"):
+            raise ValueError(f"Lid type '{lid_type}' is invalid. Must be 'snap', 'slide', or 'none'.")
+        assert_non_negative("lid_clearance", config.get("lid_clearance", 0.3))
+        if W <= 2 * t:
+            raise ValueError(f"Width ({W}mm) must be greater than twice the material thickness ({2*t}mm).")
+        if D <= 2 * t:
+            raise ValueError(f"Depth ({D}mm) must be greater than twice the material thickness ({2*t}mm).")
+
+    elif tool_name == "generate_kerf_test":
+        assert_positive("material_thickness", config.get("material_thickness", 3))
+        k_min = assert_non_negative("kerf_min", config.get("kerf_min", 0.0))
+        k_max = assert_non_negative("kerf_max", config.get("kerf_max", 0.5))
+        assert_positive("kerf_step", config.get("kerf_step", 0.05))
+        assert_positive("test_length", config.get("test_length", 30))
+        if k_min > k_max:
+            raise ValueError("kerf_min cannot be greater than kerf_max.")
+
+    elif tool_name == "generate_finger_test":
+        assert_positive("material_thickness", config.get("material_thickness", 3))
+        fw = assert_positive("finger_width", config.get("finger_width", 5))
+        assert_integer("finger_count", config.get("finger_count", 5), 1)
+        assert_positive("height", config.get("height", 30))
+        off_min = config.get("offset_min", -0.2)
+        off_max = config.get("offset_max", 0.2)
+        off_step = config.get("offset_step", 0.05)
+        try:
+            off_min = float(off_min)
+            off_max = float(off_max)
+            off_step = float(off_step)
+        except (ValueError, TypeError):
+            raise ValueError("Offsets must be numeric.")
+        if off_min > off_max:
+            raise ValueError("offset_min cannot be greater than offset_max.")
+        if off_step <= 0:
+            raise ValueError("offset_step must be greater than 0.")
+        if fw + off_min <= 0:
+            raise ValueError(f"offset_min ({off_min}) is too negative for finger_width ({fw}). Resulting tab width is non-positive.")
+        if fw - off_max <= 0:
+            raise ValueError(f"offset_max ({off_max}) is too large for finger_width ({fw}). Resulting slot width is non-positive.")
+
+    elif tool_name == "generate_3d_box":
+        W = assert_positive("width", config.get("width", 80))
+        D = assert_positive("depth", config.get("depth", 60))
+        H = assert_positive("height", config.get("height", 40))
+        wt = assert_positive("wall_thickness", config.get("wall_thickness", 2.0))
+        bt = assert_positive("bottom_thickness", config.get("bottom_thickness", 2.0))
+        lid_type = config.get("lid_type", "snap")
+        if lid_type not in ("snap", "thread", "none"):
+            raise ValueError(f"Lid type '{lid_type}' is invalid. Must be 'snap', 'thread', or 'none'.")
+        cr = assert_non_negative("corner_radius", config.get("corner_radius", 3.0))
+        assert_non_negative("lid_height", config.get("lid_height", 10))
+        assert_non_negative("tolerance", config.get("tolerance", 0.2))
+        if W <= 2 * wt:
+            raise ValueError("width must be greater than twice the wall_thickness.")
+        if D <= 2 * wt:
+            raise ValueError("depth must be greater than twice the wall_thickness.")
+        if H <= bt:
+            raise ValueError("height must be greater than bottom_thickness.")
+        if cr > min(W, D) / 2:
+            raise ValueError("corner_radius cannot be greater than half of width or depth.")
+
+    elif tool_name == "generate_bracket":
+        W = assert_positive("width", config.get("width", 40))
+        H = assert_positive("height", config.get("height", 40))
+        dep = assert_positive("depth", config.get("depth", 20))
+        wall = assert_positive("wall", config.get("wall", 3.0))
+        assert_non_negative("hole_d", config.get("hole_d", 0))
+        mh = config.get("mount_holes", 4)
+        if mh not in (0, 2, 4):
+            raise ValueError("mount_holes must be 0, 2, or 4.")
+        assert_non_negative("mount_hole_d", config.get("mount_hole_d", 3.2))
+        btype = config.get("type", "L")
+        if btype not in ("L", "U", "flat"):
+            raise ValueError("Bracket type must be 'L', 'U', or 'flat'.")
+        if btype == "U" and W <= 2 * wall:
+            raise ValueError("width must be greater than twice the wall thickness for U brackets.")
+        if btype == "L" and config.get("gusset", True):
+            if dep <= wall or H <= wall:
+                raise ValueError("Wall thickness exceeds depth/height limits for L bracket gusset.")
+
+    elif tool_name == "generate_enclosure":
+        W = assert_positive("width", config.get("width", 100))
+        D = assert_positive("depth", config.get("depth", 60))
+        H = assert_positive("height", config.get("height", 30))
+        wall = assert_positive("wall", config.get("wall", 2.5))
+        lid_type = config.get("lid_type", "snap")
+        if lid_type not in ("snap", "screw"):
+            raise ValueError("Lid type must be 'snap' or 'screw'.")
+        cr = assert_non_negative("corner_radius", config.get("corner_radius", 3))
+        if cr > min(W, D) / 2:
+            raise ValueError("corner_radius cannot be greater than half of width or depth.")
+        if lid_type == "screw" and cr < 1.6:
+            raise ValueError("corner_radius must be at least 1.6 for screw lids to accommodate screw holes.")
+        if W <= 2 * wall or D <= 2 * wall or H <= 2 * wall:
+            raise ValueError("Dimensions must be greater than twice the wall thickness.")
+        
+        stod = assert_positive("standoff_d", config.get("standoff_d", 5))
+        stoid = assert_positive("standoff_hole_d", config.get("standoff_hole_d", 2.5))
+        if stod <= stoid:
+            raise ValueError("standoff_d must be greater than standoff_hole_d.")
+        assert_positive("standoff_h", config.get("standoff_h", 5))
+        
+        for s in config.get("pcb_standoffs", []):
+            if not isinstance(s, dict):
+                raise ValueError("Each pcb_standoff must be a dictionary.")
+            sx = assert_non_negative("standoff x", s.get("x"))
+            sy = assert_non_negative("standoff y", s.get("y"))
+            if not (wall + stod/2 <= sx <= W - wall - stod/2):
+                raise ValueError(f"Standoff x coordinate ({sx}mm) must be inside the walls.")
+            if not (wall + stod/2 <= sy <= D - wall - stod/2):
+                raise ValueError(f"Standoff y coordinate ({sy}mm) must be inside the walls.")
+
+    elif tool_name == "generate_tolerance_test":
+        assert_positive("base_width", config.get("base_width", 80))
+        assert_positive("base_depth", config.get("base_depth", 60))
+        assert_positive("base_height", config.get("base_height", 3))
+        assert_positive("pin_height", config.get("pin_height", 15))
+        assert_positive("pin_d", config.get("pin_d", 10))
+        assert_positive("hole_d", config.get("hole_d", 10))
+        tol_min = config.get("tol_min", -0.3)
+        tol_max = config.get("tol_max", 0.3)
+        tol_step = config.get("tol_step", 0.1)
+        assert_non_negative("gap", config.get("gap", 5))
+        try:
+            tol_min = float(tol_min)
+            tol_max = float(tol_max)
+            tol_step = float(tol_step)
+        except (ValueError, TypeError):
+            raise ValueError("Tolerance bounds must be numeric.")
+        if tol_min > tol_max:
+            raise ValueError("tol_min cannot be greater than tol_max.")
+        if tol_step <= 0:
+            raise ValueError("tol_step must be greater than 0.")
+
+    elif tool_name == "generate_bed_level_test":
+        bx = assert_positive("bed_x", config.get("bed_x", 220))
+        by = assert_positive("bed_y", config.get("bed_y", 220))
+        dd = assert_positive("disc_d", config.get("disc_d", 30))
+        assert_positive("disc_h", config.get("disc_h", 0.2))
+        assert_integer("grid_cols", config.get("grid_cols", 5), 1)
+        assert_integer("grid_rows", config.get("grid_rows", 5), 1)
+        assert_non_negative("skirt_w", config.get("skirt_w", 1))
+        if bx < dd + 10 or by < dd + 10:
+            raise ValueError("Bed dimensions must be larger than disc diameter + margins.")
+
+    elif tool_name == "generate_retraction_test":
+        assert_positive("tower_d", config.get("tower_d", 10))
+        assert_positive("tower_h", config.get("tower_h", 80))
+        assert_integer("tower_count", config.get("tower_count", 5), 1)
+        assert_positive("tower_gap", config.get("tower_gap", 20))
+        assert_positive("base_h", config.get("base_h", 2))
+        assert_non_negative("base_pad", config.get("base_pad", 5))
+
+    elif tool_name == "generate_living_hinge":
+        assert_positive("width", config.get("width", 100))
+        assert_positive("height", config.get("height", 60))
+        assert_positive("material_thickness", config.get("material_thickness", 3))
+        assert_non_negative("kerf", config.get("kerf", 0.2))
+        assert_positive("cut_length", config.get("cut_length", 15))
+        assert_positive("cut_gap", config.get("cut_gap", 2))
+        assert_positive("row_spacing", config.get("row_spacing", 3))
+        assert_non_negative("margin", config.get("margin", 5))
+        pattern = config.get("pattern", "straight")
+        if pattern not in ("straight", "serpentine", "cross"):
+            raise ValueError("Pattern must be 'straight', 'serpentine', or 'cross'.")
+
+    elif tool_name == "generate_dogbone":
+        W = assert_positive("width", config.get("width", 50))
+        H = assert_positive("height", config.get("height", 30))
+        assert_positive("depth", config.get("depth", 5))
+        tool_d = assert_positive("tool_d", config.get("tool_d", 3.175))
+        assert_positive("material_thickness", config.get("material_thickness", 6))
+        style = config.get("corner_style", "dogbone")
+        if style not in ("dogbone", "tbone_h", "tbone_v"):
+            raise ValueError("Corner style must be 'dogbone', 'tbone_h', or 'tbone_v'.")
+        if W < tool_d or H < tool_d:
+            raise ValueError("Pocket dimensions must be at least the tool diameter.")
+
+    elif tool_name == "suggest_orientation":
+        assert_positive("width", config.get("width", 80))
+        assert_positive("depth", config.get("depth", 60))
+        assert_positive("height", config.get("height", 40))
+
+    elif tool_name == "generate_assembly":
+        for piece in config.get("pieces", []):
+            if not isinstance(piece, dict):
+                raise ValueError("Each piece must be a dictionary.")
+            name = piece.get("name")
+            if not name or not isinstance(name, str):
+                raise ValueError("Piece name must be a non-empty string.")
+            ptype = piece.get("type", "box")
+            if ptype not in ("box", "cylinder", "custom"):
+                raise ValueError("Piece type must be 'box', 'cylinder', or 'custom'.")
+            assert_positive("piece width (w)", piece.get("w", 10))
+            assert_positive("piece depth (d)", piece.get("d", 10))
+            assert_positive("piece height (h)", piece.get("h", 10))
+            assert_integer("piece qty", piece.get("qty", 1), 1)
+            
+            for prop in ("translate", "rotate", "color"):
+                val = piece.get(prop)
+                if val is not None:
+                    if not isinstance(val, (list, tuple)) or len(val) != 3:
+                        raise ValueError(f"Piece property '{prop}' must be a list/tuple of 3 elements.")
+                    for item in val:
+                        try:
+                            float(item)
+                        except (ValueError, TypeError):
+                            raise ValueError(f"Elements of piece property '{prop}' must be numeric.")
+                    if prop == "color":
+                        for item in val:
+                            if not (0 <= float(item) <= 1):
+                                raise ValueError("Color channel values must be between 0 and 1.")
+
+    elif tool_name == "generate_cnc_toolpath_hints":
+        assert_positive("material_thickness", config.get("material_thickness", 6))
+        assert_positive("tool_d", config.get("tool_d", 3.175))
+        assert_integer("tool_flutes", config.get("tool_flutes", 2), 1)
+
+# ──────────────────────────────────────────────
+# TempFilePath class for automatic temp file deletion on GC
+# ──────────────────────────────────────────────
+class TempFilePath(str):
+    def __del__(self):
+        try:
+            if os.path.exists(self):
+                os.remove(self)
+        except Exception:
+            pass
+
+# ──────────────────────────────────────────────
 # Utilitário interno: roda openscad
 # ──────────────────────────────────────────────
 def run_openscad(scad_code: str, output_ext: str, export_args=None):
+    verify_safety_guidelines(scad_code)
     if export_args is None:
         export_args = []
 
@@ -30,12 +374,27 @@ def run_openscad(scad_code: str, output_ext: str, export_args=None):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0 and not os.path.exists(out_path):
             raise RuntimeError(f"OpenSCAD Error:\n{result.stderr}")
-        return out_path, result.stdout + result.stderr
+        return TempFilePath(out_path), result.stdout + result.stderr
     except subprocess.TimeoutExpired:
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
         raise RuntimeError("OpenSCAD Error: Execution timed out after 60 seconds.")
+    except Exception as e:
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+        raise e
     finally:
         if os.path.exists(scad_path):
-            os.remove(scad_path)
+            try:
+                os.remove(scad_path)
+            except Exception:
+                pass
 
 
 # ──────────────────────────────────────────────
@@ -46,6 +405,7 @@ def check_scad_syntax(scad_code: str) -> tuple:
     Verifica sintaxe do código SCAD usando openscad.
     Retorna (is_valid, message).
     """
+    verify_safety_guidelines(scad_code)
     with tempfile.NamedTemporaryFile(suffix=".scad", delete=False, mode='w') as f:
         f.write(scad_code)
         scad_path = f.name
@@ -67,7 +427,10 @@ def check_scad_syntax(scad_code: str) -> tuple:
         return False, "❌ Timeout ao verificar sintaxe."
     finally:
         if os.path.exists(scad_path):
-            os.remove(scad_path)
+            try:
+                os.remove(scad_path)
+            except Exception:
+                pass
 
 
 # ──────────────────────────────────────────────
@@ -89,7 +452,7 @@ def generate_laser_scad(config: dict) -> str:
     gap  = 15
 
     def finger_loop_with_exclusions(total_len, n_fingers, exclusions, axis='x',
-                                    is_tab=True, depth=None):
+                                    is_tab=True, depth=None, y_override=None):
         if depth is None:
             depth = t
         fw = total_len / n_fingers
@@ -103,14 +466,18 @@ def generate_laser_scad(config: dict) -> str:
                 continue
             if axis == 'x':
                 if is_tab:
-                    lines.append(f"        translate([{x0:.4f}, {-depth:.4f}]) square([{x1-x0:.4f}, {depth:.4f}]);")
+                    y_val = f"{-depth:.4f}" if y_override is None else y_override
+                    lines.append(f"        translate([{x0:.4f}, {y_val}]) square([{x1-x0:.4f}, {depth:.4f}]);")
                 else:
-                    lines.append(f"        translate([{x0:.4f}, 0]) square([{x1-x0:.4f}, {slot:.4f}]);")
+                    y_val = "0" if y_override is None else y_override
+                    lines.append(f"        translate([{x0:.4f}, {y_val}]) square([{x1-x0:.4f}, {slot:.4f}]);")
             else:
                 if is_tab:
-                    lines.append(f"        translate([{-depth:.4f}, {x0:.4f}]) square([{depth:.4f}, {x1-x0:.4f}]);")
+                    x_val = f"{-depth:.4f}" if y_override is None else y_override
+                    lines.append(f"        translate([{x_val}, {x0:.4f}]) square([{depth:.4f}, {x1-x0:.4f}]);")
                 else:
-                    lines.append(f"        translate([0, {x0:.4f}]) square([{slot:.4f}, {x1-x0:.4f}]);")
+                    x_val = "0" if y_override is None else y_override
+                    lines.append(f"        translate([{x_val}, {x0:.4f}]) square([{slot:.4f}, {x1-x0:.4f}]);")
         return "\n".join(lines)
 
     def side_finger_loop(total_len, n_fingers, is_tab=True, depth=None, side='left'):
@@ -167,20 +534,10 @@ def generate_laser_scad(config: dict) -> str:
     front_tabs  = finger_loop_with_exclusions(W, N, front_excl, axis='x', is_tab=True)
     back_tabs   = finger_loop_with_exclusions(W, N, back_excl,  axis='x', is_tab=True)
     floor_f_slots = finger_loop_with_exclusions(W, N, front_excl, axis='x', is_tab=False)
-    floor_b_slots = finger_loop_with_exclusions(W, N, back_excl,  axis='x', is_tab=False)
+    floor_b_slots_translated = finger_loop_with_exclusions(W, N, back_excl, axis='x', is_tab=False, y_override="D-slot")
 
     front_openings_scad = "\n".join(opening_scad(op) for op in front_ops)
     back_openings_scad  = "\n".join(opening_scad(op) for op in back_ops)
-
-    # Build translated back slots for floor
-    back_slot_lines = []
-    for ln in floor_b_slots.splitlines():
-        ln = ln.strip()
-        if ln and "translate" in ln:
-            coords_part = ln.split("translate([")[1].split(", 0])")[0]
-            dim_part = ln.split("square([")[1].split("])")[0]
-            back_slot_lines.append(f"        translate([{coords_part}, D-slot]) square([{dim_part}]);")
-    floor_b_slots_translated = "\n".join(back_slot_lines)
 
     scad = f"""// ============================================================
 // Gerado automaticamente pelo MCP-OpenSCAD Laser Tool
@@ -335,7 +692,7 @@ def generate_box_scad(config: dict) -> str:
     if N % 2 == 0:
         N += 1
 
-    def tabs_bottom(length, n, is_tab=True):
+    def tabs_bottom(length, n, is_tab=True, y_override=None):
         """Dentes/fendas na borda inferior (Y=0)."""
         fw = length / n
         lines = []
@@ -343,9 +700,11 @@ def generate_box_scad(config: dict) -> str:
             x0 = i * fw + (0 if i == 0 else kerf / 2)
             x1 = (i + 1) * fw - (0 if i == n - 1 else kerf / 2)
             if is_tab:
-                lines.append(f"    translate([{x0:.3f}, {-t:.3f}]) square([{x1-x0:.3f}, {t:.3f}]);")
+                y_val = f"{-t:.3f}" if y_override is None else y_override
+                lines.append(f"    translate([{x0:.3f}, {y_val}]) square([{x1-x0:.3f}, {t:.3f}]);")
             else:
-                lines.append(f"    translate([{x0:.3f}, 0]) square([{x1-x0:.3f}, {slot:.3f}]);")
+                y_val = "0" if y_override is None else y_override
+                lines.append(f"    translate([{x0:.3f}, {y_val}]) square([{x1-x0:.3f}, {slot:.3f}]);")
         return "\n".join(lines)
 
     def tabs_side(length, n, is_tab=True, side='left'):
@@ -368,14 +727,7 @@ def generate_box_scad(config: dict) -> str:
 
     # Build back-translated floor slots
     front_slot_lines = tabs_bottom(W, N, is_tab=False)
-    back_slot_lines_raw = []
-    for ln in front_slot_lines.splitlines():
-        ln = ln.strip()
-        if ln and "translate" in ln:
-            coords_part = ln.split("translate([")[1].split(", 0])")[0]
-            dim_part = ln.split("square([")[1].split("])")[0]
-            back_slot_lines_raw.append(f"    translate([{coords_part}, {D - slot:.3f}]) square([{dim_part}]);")
-    back_slots_floor = "\n".join(back_slot_lines_raw)
+    back_slots_floor = tabs_bottom(W, N, is_tab=False, y_override=f"{D - slot:.3f}")
 
     # Divisórias X (paralelas ao eixo depth, cortam ao longo de D)
     divider_floor_slots = ""
@@ -729,7 +1081,7 @@ def validate_config(config: dict) -> list:
     warnings = []
     t    = config.get("material_thickness", 3)
     W    = config.get("width", 100)
-    N    = config.get("fingers", 5)
+    N    = max(1, config.get("fingers", 5))
     fw   = W / N
     openings = config.get("openings", [])
 
@@ -2460,7 +2812,6 @@ async def handle_list_tools() -> list:
                 "required": ["output_dir", "project_name"]
             }
         ),
-        # Laser decoration / CNC tools
         types.Tool(
             name="generate_living_hinge",
             description=(
@@ -2583,9 +2934,48 @@ async def handle_call_tool(
     name: str, arguments: dict | None
 ) -> list:
 
+    # ── Security, Safety, and Validation Interceptor ──────────────────
+    if not arguments:
+        arguments = {}
+
+    # Safety checks (keywords check)
+    scad_code_for_safety = arguments.get("scad_code", "")
+    project_name_for_safety = arguments.get("project_name", "")
+    # Check custom SCAD in config if present
+    cfg = arguments.get("config", {})
+    if isinstance(cfg, dict):
+        for piece in cfg.get("pieces", []):
+            if isinstance(piece, dict) and "scad" in piece:
+                scad_code_for_safety += " " + str(piece["scad"])
+        if "project_name" in cfg:
+            project_name_for_safety += " " + str(cfg["project_name"])
+    verify_safety_guidelines(scad_code_for_safety, project_name_for_safety)
+
+    # Path traversal validation/sanitization
+    if "output_path" in arguments:
+        arguments["output_path"] = validate_output_path(arguments["output_path"])
+    
+    if "output_dir" in arguments:
+        output_dir = arguments.get("output_dir", "/tmp")
+        project_name = arguments.get("project_name", "project")
+        sanitized_dir, sanitized_proj = safe_output_path(output_dir, project_name)
+        arguments["output_dir"] = sanitized_dir
+        arguments["project_name"] = sanitized_proj
+
+    # Config parameters validation (checking negative values, divisions, limits)
+    if "config" in arguments:
+        if name in [
+            "generate_laser_part", "generate_box", "generate_kerf_test", "generate_finger_test",
+            "generate_3d_box", "generate_bracket", "generate_enclosure", "validate_printability",
+            "generate_tolerance_test", "generate_bed_level_test", "generate_retraction_test",
+            "generate_living_hinge", "generate_dogbone", "suggest_orientation", "generate_assembly",
+            "generate_cnc_toolpath_hints"
+        ]:
+            validate_config_parameters(name, arguments["config"])
+
     # ── Exportação básica ──────────────────────────────────────────
     if name in ["render_to_png", "export_stl", "export_3mf", "export_dxf", "export_svg"]:
-        if not arguments or "scad_code" not in arguments:
+        if "scad_code" not in arguments:
             raise ValueError("Missing 'scad_code' argument")
 
         scad_code = arguments["scad_code"]
@@ -2625,28 +3015,41 @@ async def handle_call_tool(
             height = img_size.get("height", 600)
             render_args.extend(["--imgsize", f"{width},{height}"])
 
+            out_path = None
             try:
                 out_path, _ = run_openscad(scad_code, "png", render_args)
                 with open(out_path, "rb") as f:
                     img_data = base64.b64encode(f.read()).decode("utf-8")
-                os.remove(out_path)
                 return [
                     types.TextContent(type="text", text="Rendered successfully."),
                     types.ImageContent(type="image", data=img_data, mimeType="image/png")
                 ]
             except Exception as e:
                 return [types.TextContent(type="text", text=str(e))]
+            finally:
+                if out_path and os.path.exists(out_path):
+                    try:
+                        os.remove(out_path)
+                    except Exception:
+                        pass
         else:
             if "output_path" not in arguments:
                 raise ValueError("Missing 'output_path' argument")
             output_path = arguments["output_path"]
             ext = name.split("_")[1]
+            out_path = None
             try:
                 out_path, _ = run_openscad(scad_code, ext, extra_args)
                 shutil.move(out_path, output_path)
                 return [types.TextContent(type="text", text=f"Exported successfully to {output_path}")]
             except Exception as e:
                 return [types.TextContent(type="text", text=str(e))]
+            finally:
+                if out_path and os.path.exists(out_path):
+                    try:
+                        os.remove(out_path)
+                    except Exception:
+                        pass
 
     elif name == "check_syntax":
         if not arguments or "scad_code" not in arguments:

@@ -1881,3 +1881,269 @@ async def test_render_to_png_custom_size():
     })
     assert len(result) == 2
     assert result[1].type == "image"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Testes Adicionais de Segurança, Sanitização e Validação (v0.6.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_verify_safety_guidelines_banned_word():
+    with pytest.raises(ValueError, match="Safety violation"):
+        server.verify_safety_guidelines("cube([1,1,1]); // gun model here")
+
+def test_verify_safety_guidelines_rocket_nozzle():
+    with pytest.raises(ValueError, match="Safety violation"):
+        server.verify_safety_guidelines("cylinder(d1=10, d2=20, h=30); // rocket nozzle")
+
+def test_verify_safety_guidelines_safe_nozzle():
+    # standard nozzle settings should be allowed
+    server.verify_safety_guidelines("nozzle_d = 0.4; cube([10,10,10]);")
+
+def test_validate_output_path_allowed():
+    path = "/tmp/some_file.scad"
+    assert server.validate_output_path(path) == os.path.abspath(path)
+
+def test_validate_output_path_denied():
+    with pytest.raises(ValueError, match="Access denied"):
+        server.validate_output_path("/etc/passwd")
+
+def test_safe_output_path_sanitization():
+    out_dir, proj = server.safe_output_path("/tmp/test_dir", "../../../etc/bad_project")
+    assert proj == "bad_project"
+    assert out_dir == "/tmp/test_dir"
+
+def test_validate_config_parameters_negative_value():
+    with pytest.raises(ValueError, match="must be strictly positive"):
+        server.validate_config_parameters("generate_laser_part", {
+            "width": -10, "depth": 80, "height": 50, "material_thickness": 3
+        })
+
+def test_validate_config_parameters_non_numeric():
+    with pytest.raises(ValueError, match="must be numeric"):
+        server.validate_config_parameters("generate_laser_part", {
+            "width": "abc", "depth": 80, "height": 50, "material_thickness": 3
+        })
+
+def test_validate_config_parameters_impossible_dimensions():
+    with pytest.raises(ValueError, match="must be greater than twice"):
+        server.validate_config_parameters("generate_laser_part", {
+            "width": 5, "depth": 80, "height": 50, "material_thickness": 3
+        })
+
+def test_validate_config_parameters_negative_fingers():
+    with pytest.raises(ValueError, match="must be at least 1"):
+        server.validate_config_parameters("generate_laser_part", {
+            "width": 100, "depth": 80, "height": 50, "material_thickness": 3, "fingers": -2
+        })
+
+def test_validate_config_parameters_3d_box_impossible_radius():
+    with pytest.raises(ValueError, match="corner_radius cannot be greater"):
+        server.validate_config_parameters("generate_3d_box", {
+            "width": 80, "depth": 60, "height": 40, "wall_thickness": 2, "bottom_thickness": 2,
+            "corner_radius": 50
+        })
+
+def test_validate_config_parameters_enclosure_standoff_out_of_bounds():
+    with pytest.raises(ValueError, match="must be inside the walls"):
+        server.validate_config_parameters("generate_enclosure", {
+            "width": 100, "depth": 60, "height": 30, "wall": 2.5, "lid_type": "snap",
+            "standoff_d": 5, "standoff_hole_d": 2.5, "standoff_h": 5,
+            "pcb_standoffs": [{"x": 1, "y": 10}] # sx=1 is less than wall + stod/2 = 2.5 + 2.5 = 5.0
+        })
+
+def test_validate_config_parameters_bracket_gusset_oversize():
+    with pytest.raises(ValueError, match="Wall thickness exceeds depth/height limits"):
+        server.validate_config_parameters("generate_bracket", {
+            "type": "L", "width": 40, "height": 10, "depth": 20, "wall": 15, "gusset": True
+        })
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_safety_block():
+    with pytest.raises(ValueError, match="Safety violation"):
+        await server.handle_call_tool("render_to_png", {
+            "scad_code": "cube([10,10,10]); // bomb activator"
+        })
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_path_traversal_block():
+    with pytest.raises(ValueError, match="Access denied"):
+        await server.handle_call_tool("export_stl", {
+            "scad_code": "cube([5,5,5]);",
+            "output_path": "/etc/passwd"
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Testes de Validação Completa de Parâmetros (validate_config_parameters)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_validate_config_not_dict():
+    with pytest.raises(ValueError, match="Configuration must be a dictionary"):
+        server.validate_config_parameters("generate_laser_part", "not-a-dict")
+
+def test_validate_helpers_edge_cases():
+    # Test assert_positive missing/None value
+    with pytest.raises(ValueError, match="Parameter .* is missing"):
+        server.validate_config_parameters("generate_laser_part", {"width": None})
+    
+    # Test assert_positive non-numeric
+    with pytest.raises(ValueError, match="must be numeric"):
+        server.validate_config_parameters("generate_laser_part", {"width": "invalid"})
+
+    # Test assert_non_negative missing
+    with pytest.raises(ValueError, match="Parameter .* is missing"):
+        server.validate_config_parameters("generate_laser_part", {"kerf": None})
+
+    # Test assert_integer missing
+    with pytest.raises(ValueError, match="Parameter .* is missing"):
+        server.validate_config_parameters("generate_laser_part", {"fingers": None})
+
+    # Test assert_integer non-numeric
+    with pytest.raises(ValueError, match="must be an integer"):
+        server.validate_config_parameters("generate_laser_part", {"fingers": "abc"})
+
+def test_validate_laser_part_impossible():
+    # Width <= 2 * t
+    with pytest.raises(ValueError, match="Width .* must be greater than twice the material thickness"):
+        server.validate_config_parameters("generate_laser_part", {"width": 5, "material_thickness": 3})
+    # Depth <= 2 * t
+    with pytest.raises(ValueError, match="Depth .* must be greater than twice the material thickness"):
+        server.validate_config_parameters("generate_laser_part", {"depth": 5, "material_thickness": 3})
+
+    # Openings validation
+    with pytest.raises(ValueError, match="Each opening must be a dictionary"):
+        server.validate_config_parameters("generate_laser_part", {"openings": ["not-a-dict"]})
+    
+    with pytest.raises(ValueError, match="Opening wall .* is invalid"):
+        server.validate_config_parameters("generate_laser_part", {"openings": [{"wall": "top"}]})
+        
+    with pytest.raises(ValueError, match="Opening shape .* is invalid"):
+        server.validate_config_parameters("generate_laser_part", {"openings": [{"wall": "front", "shape": "hexagon"}]})
+
+    # Rect opening bad parameters
+    with pytest.raises(ValueError, match="Parameter 'opening x' must be non-negative"):
+        server.validate_config_parameters("generate_laser_part", {"openings": [{"wall": "front", "shape": "rect", "x": -1}]})
+    with pytest.raises(ValueError, match="Parameter 'opening w' must be strictly positive"):
+        server.validate_config_parameters("generate_laser_part", {"openings": [{"wall": "front", "shape": "rect", "w": 0}]})
+
+    # Circle opening bad parameters
+    with pytest.raises(ValueError, match="Parameter 'opening cx' must be non-negative"):
+        server.validate_config_parameters("generate_laser_part", {"openings": [{"wall": "front", "shape": "circle", "cx": -5}]})
+    with pytest.raises(ValueError, match="Parameter 'opening d' must be strictly positive"):
+        server.validate_config_parameters("generate_laser_part", {"openings": [{"wall": "front", "shape": "circle", "d": -2}]})
+
+def test_validate_box_lid_type_and_dimensions():
+    with pytest.raises(ValueError, match="Lid type .* is invalid"):
+        server.validate_config_parameters("generate_box", {"lid_type": "screw"})
+    
+    with pytest.raises(ValueError, match="Width .* must be greater than twice the material thickness"):
+        server.validate_config_parameters("generate_box", {"width": 5, "material_thickness": 3})
+
+def test_validate_kerf_test_bounds():
+    with pytest.raises(ValueError, match="kerf_min cannot be greater than kerf_max"):
+        server.validate_config_parameters("generate_kerf_test", {"kerf_min": 0.5, "kerf_max": 0.2})
+
+def test_validate_finger_test_bounds():
+    # off_min > off_max
+    with pytest.raises(ValueError, match="offset_min cannot be greater than offset_max"):
+        server.validate_config_parameters("generate_finger_test", {"offset_min": 0.3, "offset_max": 0.1})
+    # off_step <= 0
+    with pytest.raises(ValueError, match="offset_step must be greater than 0"):
+        server.validate_config_parameters("generate_finger_test", {"offset_step": -0.1})
+    # non-numeric offsets
+    with pytest.raises(ValueError, match="Offsets must be numeric"):
+        server.validate_config_parameters("generate_finger_test", {"offset_min": "abc"})
+    # tab width non-positive
+    with pytest.raises(ValueError, match="Resulting tab width is non-positive"):
+        server.validate_config_parameters("generate_finger_test", {"finger_width": 5, "offset_min": -6})
+    # slot width non-positive
+    with pytest.raises(ValueError, match="Resulting slot width is non-positive"):
+        server.validate_config_parameters("generate_finger_test", {"finger_width": 5, "offset_max": 6})
+
+def test_validate_3d_box_params():
+    # Invalid lid type
+    with pytest.raises(ValueError, match="Lid type .* is invalid"):
+        server.validate_config_parameters("generate_3d_box", {"lid_type": "slide"})
+    # width <= 2 * wt
+    with pytest.raises(ValueError, match="width must be greater than twice the wall_thickness"):
+        server.validate_config_parameters("generate_3d_box", {"width": 10, "wall_thickness": 6})
+    # depth <= 2 * wt
+    with pytest.raises(ValueError, match="depth must be greater than twice the wall_thickness"):
+        server.validate_config_parameters("generate_3d_box", {"depth": 10, "wall_thickness": 6})
+    # height <= bt
+    with pytest.raises(ValueError, match="height must be greater than bottom_thickness"):
+        server.validate_config_parameters("generate_3d_box", {"height": 5, "bottom_thickness": 6})
+
+def test_validate_bracket_params():
+    # mount_holes check
+    with pytest.raises(ValueError, match="mount_holes must be 0, 2, or 4"):
+        server.validate_config_parameters("generate_bracket", {"mount_holes": 3})
+    # type check
+    with pytest.raises(ValueError, match="Bracket type must be"):
+        server.validate_config_parameters("generate_bracket", {"type": "circular"})
+    # U-bracket width <= 2 * wall
+    with pytest.raises(ValueError, match="width must be greater than twice the wall thickness"):
+        server.validate_config_parameters("generate_bracket", {"type": "U", "width": 10, "wall": 6})
+
+def test_validate_enclosure_params():
+    # Invalid lid
+    with pytest.raises(ValueError, match="Lid type must be"):
+        server.validate_config_parameters("generate_enclosure", {"lid_type": "slide"})
+    # screw lid small corner radius
+    with pytest.raises(ValueError, match="corner_radius must be at least 1.6"):
+        server.validate_config_parameters("generate_enclosure", {"lid_type": "screw", "corner_radius": 1.0})
+    # standoff_d <= standoff_hole_d
+    with pytest.raises(ValueError, match="standoff_d must be greater than standoff_hole_d"):
+        server.validate_config_parameters("generate_enclosure", {"standoff_d": 3, "standoff_hole_d": 4})
+    # standoff dict check
+    with pytest.raises(ValueError, match="Each pcb_standoff must be a dictionary"):
+        server.validate_config_parameters("generate_enclosure", {"pcb_standoffs": ["not-a-dict"]})
+
+def test_validate_tolerance_test_params():
+    # tol_min > tol_max
+    with pytest.raises(ValueError, match="tol_min cannot be greater than tol_max"):
+        server.validate_config_parameters("generate_tolerance_test", {"tol_min": 0.5, "tol_max": 0.2})
+    # tol_step <= 0
+    with pytest.raises(ValueError, match="tol_step must be greater than 0"):
+        server.validate_config_parameters("generate_tolerance_test", {"tol_step": 0})
+    # non-numeric bounds
+    with pytest.raises(ValueError, match="Tolerance bounds must be numeric"):
+        server.validate_config_parameters("generate_tolerance_test", {"tol_min": "abc"})
+
+def test_validate_bed_level_test_params():
+    # bed too small
+    with pytest.raises(ValueError, match="Bed dimensions must be larger than disc diameter"):
+        server.validate_config_parameters("generate_bed_level_test", {"bed_x": 30, "disc_d": 40})
+
+def test_validate_living_hinge_params():
+    with pytest.raises(ValueError, match="Pattern must be"):
+        server.validate_config_parameters("generate_living_hinge", {"pattern": "diagonal"})
+
+def test_validate_dogbone_params():
+    # invalid style
+    with pytest.raises(ValueError, match="Corner style must be"):
+        server.validate_config_parameters("generate_dogbone", {"corner_style": "circle"})
+    # pocket size too small
+    with pytest.raises(ValueError, match="Pocket dimensions must be at least the tool diameter"):
+        server.validate_config_parameters("generate_dogbone", {"width": 2, "tool_d": 3})
+
+def test_validate_assembly_params():
+    # piece not dict
+    with pytest.raises(ValueError, match="Each piece must be a dictionary"):
+        server.validate_config_parameters("generate_assembly", {"pieces": ["not-a-dict"]})
+    # name missing
+    with pytest.raises(ValueError, match="Piece name must be a non-empty string"):
+        server.validate_config_parameters("generate_assembly", {"pieces": [{"w": 5}]})
+    # type invalid
+    with pytest.raises(ValueError, match="Piece type must be"):
+        server.validate_config_parameters("generate_assembly", {"pieces": [{"name": "a", "type": "sphere"}]})
+    # property length check
+    with pytest.raises(ValueError, match="must be a list/tuple of 3 elements"):
+        server.validate_config_parameters("generate_assembly", {"pieces": [{"name": "a", "translate": [1, 2]}]})
+    # non-numeric property
+    with pytest.raises(ValueError, match="must be numeric"):
+        server.validate_config_parameters("generate_assembly", {"pieces": [{"name": "a", "translate": [1, "b", 3]}]})
+    # color boundaries
+    with pytest.raises(ValueError, match="Color channel values must be between 0 and 1"):
+        server.validate_config_parameters("generate_assembly", {"pieces": [{"name": "a", "color": [1.5, 0, 0]}]})
+
