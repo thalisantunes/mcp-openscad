@@ -1830,3 +1830,54 @@ async def test_cnc_toolpath_hints_missing_config():
         await server.handle_call_tool("generate_cnc_toolpath_hints", {})
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# render_to_png com câmera avançada
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_render_to_png_default_camera():
+    """Render com câmera padrão (autocenter + viewall)."""
+    result = await server.handle_call_tool("render_to_png", {
+        "scad_code": "cube([20, 20, 20]);"
+    })
+    assert len(result) == 2
+    assert result[0].text == "Rendered successfully."
+    assert result[1].type == "image"
+
+
+@pytest.mark.asyncio
+async def test_render_to_png_custom_camera():
+    """Render com câmera personalizada."""
+    result = await server.handle_call_tool("render_to_png", {
+        "scad_code": "cube([20, 20, 20]);",
+        "camera": {
+            "translate": [10, 10, 10],
+            "rotate": [55, 0, 25],
+            "distance": 150,
+            "projection": "perspective"
+        }
+    })
+    assert len(result) == 2
+    assert result[1].type == "image"
+
+
+@pytest.mark.asyncio
+async def test_render_to_png_ortho_projection():
+    """Render com projeção ortográfica."""
+    result = await server.handle_call_tool("render_to_png", {
+        "scad_code": "sphere(r=15);",
+        "camera": {"projection": "ortho"}
+    })
+    assert len(result) == 2
+    assert result[1].type == "image"
+
+
+@pytest.mark.asyncio
+async def test_render_to_png_custom_size():
+    """Render com tamanho de imagem personalizado."""
+    result = await server.handle_call_tool("render_to_png", {
+        "scad_code": "cylinder(r=10, h=30, $fn=32);",
+        "size": {"width": 400, "height": 300}
+    })
+    assert len(result) == 2
+    assert result[1].type == "image"

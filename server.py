@@ -2091,12 +2091,27 @@ async def handle_list_tools() -> list:
         # Exportação básica
         types.Tool(
             name="render_to_png",
-            description="Render OpenSCAD code to a PNG image preview.",
+            description=(
+                "Render OpenSCAD code to a PNG image preview. "
+                "Supports camera control: angle, distance, position, projection (perspective/ortho), "
+                "and image size."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "variables": {"type": "object", "description": "Optional dict of variables (-D name=value)"},
                     "scad_code": {"type": "string", "description": "The OpenSCAD source code"},
+                    "camera": {
+                        "type": "object",
+                        "description": (
+                            "Camera settings: translate (x,y,z center), rotate (rx,ry,rz angles), "
+                            "distance (zoom), projection ('perspective' or 'ortho')"
+                        )
+                    },
+                    "size": {
+                        "type": "object",
+                        "description": "Image size: width, height in pixels (default 800x600)"
+                    },
                 },
                 "required": ["scad_code"]
             }
@@ -2585,8 +2600,33 @@ async def handle_call_tool(
                 extra_args.extend(["-D", f"{k}={v}"])
 
         if name == "render_to_png":
+            # Camera options
+            camera = arguments.get("camera", {})
+            img_size = arguments.get("size", {})
+            render_args = extra_args[:]
+
+            cam_translate = camera.get("translate")
+            cam_rotate = camera.get("rotate")
+            cam_distance = camera.get("distance")
+            projection = camera.get("projection", "perspective")
+
+            if cam_translate and cam_rotate and cam_distance:
+                tx, ty, tz = cam_translate
+                rx, ry, rz = cam_rotate
+                d = cam_distance
+                render_args.extend(["--camera", f"{tx},{ty},{tz},{rx},{ry},{rz},{d}"])
+            else:
+                render_args.extend(["--autocenter", "--viewall"])
+
+            if projection == "ortho":
+                render_args.append("--projection=ortho")
+
+            width = img_size.get("width", 800)
+            height = img_size.get("height", 600)
+            render_args.extend(["--imgsize", f"{width},{height}"])
+
             try:
-                out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"] + extra_args)
+                out_path, _ = run_openscad(scad_code, "png", render_args)
                 with open(out_path, "rb") as f:
                     img_data = base64.b64encode(f.read()).decode("utf-8")
                 os.remove(out_path)
