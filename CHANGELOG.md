@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-09-10
+
+### Added
+- `analyze_mesh` — new tool (25 total): pure-Python STL analysis for printability, no
+  numpy/new dependencies. Accepts `stl_path` (existing file, validated the same way as
+  other output paths) or `scad_code` (+ `variables`, `timeout_s`; exported to STL via
+  `run_openscad` first). Parses both binary and ASCII STL (detected by file size:
+  binary iff `size == 84 + 50*n`).
+  - `non_manifold_edges` / `watertight` — via sorted vertex-index edge pairs (an edge
+    is manifold iff exactly 2 faces reference it)
+  - `components` (union-find over shared vertices, coordinates deduped at 1e-6) with
+    per-component triangles/bbox/z_min, and `floating_components` — components whose
+    `z_min` sits more than `bed_tol` above the mesh's global `z_min` (started in
+    mid-air; need support or reorientation)
+  - `volume_mm3` (signed tetrahedron sum, absolute value) and `surface_mm2`
+  - Overhang analysis against a configurable `overhang_deg` (default 45°): faces with
+    downward normal `nz < -sin(overhang_deg)` that aren't resting on the bed are
+    flagged, reporting `overhang_area_mm2` / `overhang_pct` of the downward-facing
+    area and the 5 lowest-z overhang face centroids with their angle. Convention used
+    throughout: 0° = vertical wall, 90° = horizontal ceiling
+    (`angle = degrees(asin(-nz))`)
+  - Bridge detection: ceiling faces (angle > 85°) off the bed are clustered by shared
+    edges; reports total bridge area and the largest cluster's bbox span, so a long
+    unsupported span is visible before slicing
+  - `printable` verdict (errors: not watertight, floating components; warnings:
+    overhang > 5%, bridge span > 30mm, multiple components) with a `summary` string,
+    matching the `validate_printability` convention
+  - Hard cap of 2,000,000 triangles with a clear error; designed to analyze ~200k
+    triangles in a few seconds using dict-keyed dedup and union-find instead of
+    per-face object churn
+
+### Changed
+- `run_openscad()` timeout is now configurable via `timeout_s` (clamped to
+  `[5, 900]` seconds, default 60 — was hard-coded at 60) and exposed as an optional
+  `timeout_s` argument on `export_stl`, `export_3mf`, `export_dxf`, `export_svg`, and
+  `render_to_png`. The timeout error message now includes the value actually used
+  (e.g. `"timed out after 300 seconds"`).
+
+### Tests
+- **274 tests** (up from 254), **95% coverage** maintained
+- 20 new tests: STL parsing (binary + ASCII), watertight/non-manifold detection,
+  connected components + floating detection, overhang, bridge detection, the
+  2,000,000-triangle cap, `timeout_s` clamping, and the `analyze_mesh` MCP handler
+
 ## [0.5.0] — 2026-07-16
 
 ### Security

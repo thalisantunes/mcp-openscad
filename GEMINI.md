@@ -3,12 +3,12 @@
 ## Projeto
 Servidor MCP para OpenSCAD — geração paramétrica de projetos para corte a laser, impressão 3D e CNC.
 
-- **Versão atual:** v0.5.0
-- **Arquivo principal:** `server.py` (3.670 linhas)
-- **Testes:** ~230 testes · 93% cobertura
+- **Versão atual:** v0.7.0
+- **Arquivo principal:** `server.py`
+- **Testes:** 274 testes · 95% cobertura
 - **CI:** GitHub Actions (lint + test)
 
-## Ferramentas disponíveis (24)
+## Ferramentas disponíveis (25)
 
 ### Export
 - `render_to_png` — Preview PNG de qualquer código SCAD
@@ -44,6 +44,9 @@ Servidor MCP para OpenSCAD — geração paramétrica de projetos para corte a l
 ### Multi-peças
 - `generate_assembly` — Projeto multi-peça com BOM e vista explodida
 
+### Análise
+- `analyze_mesh` — Analisa STL (binário/ASCII) ou SCAD para imprimibilidade: watertight, componentes flutuantes, volume, overhang e bridges (pura Python, sem numpy)
+
 ## Como executar
 ```bash
 # Ativar ambiente
@@ -69,6 +72,8 @@ Ver `ROADMAP.md` para o plano completo de versões.
 6. Novos geradores devem incluir valores padrão sensatos e guards contra inputs inválidos
 7. Usar `async/await` corretamente — `run_openscad` e `check_scad_syntax` são async
 8. Manter commits semânticos (feat:, fix:, test:, docs:, refactor:)
+9. `run_openscad` aceita `timeout_s` (clamp [5, 900], default 60) — exposto como parâmetro opcional em `export_stl/3mf/dxf/svg` e `render_to_png`
+10. `analyze_mesh`/`_parse_stl` não usam numpy — mantenha a análise de malha em Python puro
 
 ## Próximas Prioridades
 - Sprint 3: Refatorar `handle_call_tool` (713 linhas → helper `_generate_and_export`)

@@ -1,10 +1,12 @@
 import os
+import re
 import subprocess
 import tempfile
 import asyncio
 import math
 import shutil
 import base64
+import struct
 from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
@@ -370,10 +372,32 @@ class TempFilePath(str):
 # ──────────────────────────────────────────────
 # Utilitário interno: roda openscad
 # ──────────────────────────────────────────────
-async def run_openscad(scad_code: str, output_ext: str, export_args: list[str] | None = None) -> tuple:
+RENDER_TIMEOUT_MIN = 5.0
+RENDER_TIMEOUT_MAX = 900.0
+RENDER_TIMEOUT_DEFAULT = 60.0
+
+
+def _clamp_timeout(timeout_s) -> float:
+    """Normaliza e limita timeout_s ao intervalo [RENDER_TIMEOUT_MIN, RENDER_TIMEOUT_MAX]."""
+    try:
+        t = float(timeout_s)
+    except (TypeError, ValueError):
+        t = RENDER_TIMEOUT_DEFAULT
+    if not math.isfinite(t):
+        t = RENDER_TIMEOUT_DEFAULT
+    return max(RENDER_TIMEOUT_MIN, min(RENDER_TIMEOUT_MAX, t))
+
+
+async def run_openscad(
+    scad_code: str,
+    output_ext: str,
+    export_args: list[str] | None = None,
+    timeout_s: float = RENDER_TIMEOUT_DEFAULT,
+) -> tuple:
     verify_safety_guidelines(scad_code)
     if export_args is None:
         export_args = []
+    timeout_s = _clamp_timeout(timeout_s)
 
     with tempfile.NamedTemporaryFile(suffix=".scad", delete=False, mode='w') as f:
         f.write(scad_code)
@@ -389,7 +413,7 @@ async def run_openscad(scad_code: str, output_ext: str, export_args: list[str] |
             stderr=asyncio.subprocess.PIPE
         )
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=60)
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.communicate()
@@ -398,7 +422,7 @@ async def run_openscad(scad_code: str, output_ext: str, export_args: list[str] |
                     os.remove(out_path)
                 except Exception:
                     pass
-            raise RuntimeError("OpenSCAD Error: Execution timed out after 60 seconds.")
+            raise RuntimeError(f"OpenSCAD Error: Execution timed out after {timeout_s:g} seconds.")
         stdout = stdout_b.decode("utf-8", errors="replace")
         stderr = stderr_b.decode("utf-8", errors="replace")
         if proc.returncode != 0 and not os.path.exists(out_path):
@@ -2472,6 +2496,464 @@ def generate_cnc_toolpath_hints(config: dict) -> dict:
 
 
 # ──────────────────────────────────────────────
+# analyze_mesh: análise pura-Python de STL para imprimibilidade
+# ──────────────────────────────────────────────
+
+STL_MAX_TRIANGLES = 2_000_000
+_MESH_CEILING_ANGLE_DEG = 85.0
+
+
+class _UnionFind:
+    """Union-Find (disjoint set) com path compression + union by rank.
+
+    Cresce dinamicamente via add() — usado tanto para os componentes conexos
+    da malha (por vértice compartilhado) quanto para o agrupamento de faces
+    de "teto" em clusters de bridge (por aresta compartilhada).
+    """
+    __slots__ = ("parent", "rank")
+
+    def __init__(self, n: int = 0):
+        self.parent = list(range(n))
+        self.rank = [0] * n
+
+    def add(self) -> int:
+        idx = len(self.parent)
+        self.parent.append(idx)
+        self.rank.append(0)
+        return idx
+
+    def find(self, x: int) -> int:
+        root = x
+        while self.parent[root] != root:
+            root = self.parent[root]
+        while self.parent[x] != root:
+            self.parent[x], x = root, self.parent[x]
+        return root
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self.rank[ra] < self.rank[rb]:
+            ra, rb = rb, ra
+        self.parent[rb] = ra
+        if self.rank[ra] == self.rank[rb]:
+            self.rank[ra] += 1
+
+
+def _parse_stl(path: str) -> list:
+    """
+    Lê um arquivo STL (binário ou ASCII) e retorna lista de triângulos,
+    cada um como (v1, v2, v3) com vi = (x, y, z) float.
+
+    Detecção binário vs. ASCII: um STL binário tem tamanho exato de
+    84 + 50*n bytes (80 bytes de header + 4 bytes de contagem + 50 bytes
+    por triângulo — 12 floats de normal/vértices + 2 bytes de atributo).
+    Qualquer outro tamanho é tratado como ASCII.
+    """
+    size = os.path.getsize(path)
+    is_binary = size >= 84 and (size - 84) % 50 == 0
+
+    if is_binary:
+        n = (size - 84) // 50
+        if n > STL_MAX_TRIANGLES:
+            raise ValueError(f"STL tem {n:,} triângulos — acima do limite de {STL_MAX_TRIANGLES:,}.")
+        with open(path, "rb") as f:
+            f.seek(84)
+            data = f.read()
+        triangles = []
+        for rec in struct.iter_unpack("<12fH", data):
+            # rec = (nx,ny,nz, v1x,v1y,v1z, v2x,v2y,v2z, v3x,v3y,v3z, attr)
+            # A normal gravada é ignorada — recalculamos a partir da geometria
+            # (mais robusto: alguns exportadores gravam normais zeradas).
+            triangles.append((
+                (rec[3], rec[4], rec[5]),
+                (rec[6], rec[7], rec[8]),
+                (rec[9], rec[10], rec[11]),
+            ))
+        return triangles
+
+    # ASCII
+    with open(path, "r", errors="replace") as f:
+        text = f.read()
+    n = text.count("endfacet")
+    if n > STL_MAX_TRIANGLES:
+        raise ValueError(f"STL tem {n:,} triângulos — acima do limite de {STL_MAX_TRIANGLES:,}.")
+    tokens = re.findall(r"vertex\s+(\S+)\s+(\S+)\s+(\S+)", text)
+    triangles = []
+    usable = len(tokens) - (len(tokens) % 3)
+    for i in range(0, usable, 3):
+        v1 = tuple(float(x) for x in tokens[i])
+        v2 = tuple(float(x) for x in tokens[i + 1])
+        v3 = tuple(float(x) for x in tokens[i + 2])
+        triangles.append((v1, v2, v3))
+    return triangles
+
+
+def analyze_mesh(path: str, overhang_deg: float = 45.0, bed_tol: float = 0.3, layer_h: float = 0.2) -> dict:
+    """
+    Analisa um arquivo STL (binário ou ASCII) para imprimibilidade 3D:
+    manifoldness, componentes desconexos/flutuantes, volume, área de
+    superfície, overhangs e bridges (vãos sem suporte).
+
+    Convenção de ângulo de overhang usada em todo o retorno:
+    0° = parede vertical, 90° = teto horizontal (ângulo medido a partir
+    da vertical). Para uma face com normal unitária de componente z = nz
+    (apontando para fora do sólido): overhang_angle = degrees(asin(-nz)).
+    Uma face é candidata a overhang quando nz < -sin(overhang_deg).
+
+    Performance: pura Python, sem numpy. Usa dicts com chaves de coordenada
+    arredondada em 1e-6 para deduplicar vértices e union-find para
+    componentes/clusters — pensado para lidar com ~200k triângulos em
+    poucos segundos. Hard cap de STL_MAX_TRIANGLES triângulos.
+    """
+    triangles = _parse_stl(path)
+    n_tri = len(triangles)
+    if n_tri > STL_MAX_TRIANGLES:
+        raise ValueError(f"STL tem {n_tri:,} triângulos — acima do limite de {STL_MAX_TRIANGLES:,}.")
+    if n_tri == 0:
+        raise ValueError("STL não contém triângulos.")
+
+    vertex_map = {}
+    vertex_coords = []
+    uf = _UnionFind()
+    edge_faces = {}  # (i,j) ordenado -> [face_idx, ...]
+
+    tri_repr = [0] * n_tri
+    tri_area = [0.0] * n_tri
+    tri_nz = [0.0] * n_tri
+    tri_max_z = [0.0] * n_tri
+    tri_centroid = [None] * n_tri
+
+    volume_acc = 0.0
+    surface_acc = 0.0
+
+    def _get_vidx(pt):
+        key = (round(pt[0], 6), round(pt[1], 6), round(pt[2], 6))
+        idx = vertex_map.get(key)
+        if idx is None:
+            idx = uf.add()
+            vertex_map[key] = idx
+            vertex_coords.append(pt)
+        return idx
+
+    for fi in range(n_tri):
+        v1, v2, v3 = triangles[fi]
+        i0 = _get_vidx(v1)
+        i1 = _get_vidx(v2)
+        i2 = _get_vidx(v3)
+        uf.union(i0, i1)
+        uf.union(i1, i2)
+        tri_repr[fi] = i0
+
+        for a, b in ((i0, i1), (i1, i2), (i2, i0)):
+            key = (a, b) if a < b else (b, a)
+            lst = edge_faces.get(key)
+            if lst is None:
+                edge_faces[key] = [fi]
+            else:
+                lst.append(fi)
+
+        ux, uy, uz = v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2]
+        wx, wy, wz = v3[0] - v1[0], v3[1] - v1[1], v3[2] - v1[2]
+        cx = uy * wz - uz * wy
+        cy = uz * wx - ux * wz
+        cz = ux * wy - uy * wx
+        clen = math.sqrt(cx * cx + cy * cy + cz * cz)
+        area = clen / 2.0
+        tri_area[fi] = area
+        tri_nz[fi] = (cz / clen) if clen > 1e-12 else 0.0
+        surface_acc += area
+
+        volume_acc += (
+            v1[0] * (v2[1] * v3[2] - v2[2] * v3[1])
+            + v1[1] * (v2[2] * v3[0] - v2[0] * v3[2])
+            + v1[2] * (v2[0] * v3[1] - v2[1] * v3[0])
+        )
+
+        max_z = v1[2] if v1[2] >= v2[2] else v2[2]
+        if v3[2] > max_z:
+            max_z = v3[2]
+        tri_max_z[fi] = max_z
+        tri_centroid[fi] = (
+            (v1[0] + v2[0] + v3[0]) / 3.0,
+            (v1[1] + v2[1] + v3[1]) / 3.0,
+            (v1[2] + v2[2] + v3[2]) / 3.0,
+        )
+
+    n_vert = len(vertex_coords)
+    xs = [c[0] for c in vertex_coords]
+    ys = [c[1] for c in vertex_coords]
+    zs = [c[2] for c in vertex_coords]
+    bbox_min = (min(xs), min(ys), min(zs))
+    bbox_max = (max(xs), max(ys), max(zs))
+    z_min_global = bbox_min[2]
+    size_xyz = [bbox_max[i] - bbox_min[i] for i in range(3)]
+
+    non_manifold_edges = sum(1 for lst in edge_faces.values() if len(lst) != 2)
+    watertight = non_manifold_edges == 0
+    volume_mm3 = abs(volume_acc) / 6.0
+    surface_mm2 = surface_acc
+
+    # ── componentes conexos (por vértice compartilhado) ──
+    comp_stats = {}
+    for vi in range(n_vert):
+        root = uf.find(vi)
+        x, y, z = vertex_coords[vi]
+        st = comp_stats.get(root)
+        if st is None:
+            comp_stats[root] = {"triangles": 0, "min": [x, y, z], "max": [x, y, z]}
+        else:
+            m, M = st["min"], st["max"]
+            if x < m[0]:
+                m[0] = x
+            if y < m[1]:
+                m[1] = y
+            if z < m[2]:
+                m[2] = z
+            if x > M[0]:
+                M[0] = x
+            if y > M[1]:
+                M[1] = y
+            if z > M[2]:
+                M[2] = z
+
+    for fi in range(n_tri):
+        comp_stats[uf.find(tri_repr[fi])]["triangles"] += 1
+
+    component_details = []
+    floating = 0
+    for st in comp_stats.values():
+        z_min_c = st["min"][2]
+        is_floating = z_min_c > z_min_global + bed_tol
+        if is_floating:
+            floating += 1
+        component_details.append({
+            "triangles": st["triangles"],
+            "bbox": {"min": st["min"], "max": st["max"]},
+            "z_min": z_min_c,
+            "floating": is_floating,
+        })
+    component_details.sort(key=lambda c: c["z_min"])
+    n_components = len(comp_stats)
+
+    # ── overhang + bridges ──
+    overhang_threshold = -math.sin(math.radians(overhang_deg))
+    ceiling_threshold = -math.sin(math.radians(_MESH_CEILING_ANGLE_DEG))
+
+    down_facing_area = 0.0
+    overhang_area = 0.0
+    worst = []  # mantém as 5 piores (menor z) faces de overhang: [(z, centroid, angle_deg), ...]
+    is_ceiling = [False] * n_tri
+
+    for fi in range(n_tri):
+        nz = tri_nz[fi]
+        if nz >= 0:
+            continue
+        on_bed = tri_max_z[fi] <= z_min_global + bed_tol
+        if on_bed:
+            continue
+        down_facing_area += tri_area[fi]
+        if nz < overhang_threshold:
+            overhang_area += tri_area[fi]
+            angle = math.degrees(math.asin(max(-1.0, min(1.0, -nz))))
+            cz = tri_centroid[fi][2]
+            worst.append((cz, tri_centroid[fi], angle))
+            worst.sort(key=lambda w: w[0])
+            if len(worst) > 5:
+                worst.pop()
+        if nz < ceiling_threshold:
+            is_ceiling[fi] = True
+
+    overhang_pct = (overhang_area / down_facing_area * 100.0) if down_facing_area > 0 else 0.0
+
+    ceiling_uf = _UnionFind(n_tri)
+    for lst in edge_faces.values():
+        ceiling_faces = [f for f in lst if is_ceiling[f]]
+        base = None
+        for f in ceiling_faces:
+            if base is None:
+                base = f
+            else:
+                ceiling_uf.union(base, f)
+
+    cluster_stats = {}
+    for fi in range(n_tri):
+        if not is_ceiling[fi]:
+            continue
+        root = ceiling_uf.find(fi)
+        st = cluster_stats.get(root)
+        if st is None:
+            st = {"triangles": 0, "area": 0.0, "min": None, "max": None}
+            cluster_stats[root] = st
+        st["triangles"] += 1
+        st["area"] += tri_area[fi]
+        for vx, vy, vz in triangles[fi]:
+            if st["min"] is None:
+                st["min"] = [vx, vy, vz]
+                st["max"] = [vx, vy, vz]
+            else:
+                m, M = st["min"], st["max"]
+                if vx < m[0]:
+                    m[0] = vx
+                if vy < m[1]:
+                    m[1] = vy
+                if vz < m[2]:
+                    m[2] = vz
+                if vx > M[0]:
+                    M[0] = vx
+                if vy > M[1]:
+                    M[1] = vy
+                if vz > M[2]:
+                    M[2] = vz
+
+    bridge_area = sum(st["area"] for st in cluster_stats.values())
+    largest_cluster = None
+    if cluster_stats:
+        best = max(cluster_stats.values(), key=lambda s: s["area"])
+        dx = best["max"][0] - best["min"][0]
+        dy = best["max"][1] - best["min"][1]
+        dz = best["max"][2] - best["min"][2]
+        largest_cluster = {
+            "triangles": best["triangles"],
+            "area_mm2": best["area"],
+            "bbox_size": [dx, dy, dz],
+            "span_mm": max(dx, dy),
+        }
+
+    # ── veredito ──
+    errors = []
+    warnings_ = []
+    info = []
+
+    if not watertight:
+        errors.append(f"❌ Malha não é watertight: {non_manifold_edges} aresta(s) não-manifold (não conectam exatamente 2 faces).")
+    else:
+        info.append("✅ Malha é watertight (todas as arestas conectam exatamente 2 faces).")
+
+    if floating > 0:
+        errors.append(
+            f"❌ {floating} componente(s) flutuante(s) no ar (z_min acima de {bed_tol}mm da base) "
+            "— precisam de suporte ou reorientação."
+        )
+
+    if n_components > 1:
+        warnings_.append(f"⚠ {n_components} componentes desconexos na malha.")
+    else:
+        info.append("✅ Malha é uma única peça conexa.")
+
+    if overhang_pct > 5:
+        warnings_.append(
+            f"⚠ {overhang_pct:.1f}% da área voltada para baixo é overhang > {overhang_deg}° "
+            f"({overhang_area:.1f}mm²) — considere suporte ou reorientação."
+        )
+    elif overhang_area > 0:
+        info.append(f"✅ Overhang dentro do aceitável ({overhang_pct:.1f}% da área voltada para baixo).")
+
+    if largest_cluster and largest_cluster["span_mm"] > 30:
+        warnings_.append(
+            f"⚠ Maior bridge (vão sem suporte) tem {largest_cluster['span_mm']:.1f}mm de extensão "
+            "— considere suporte para vãos > 30mm."
+        )
+    elif bridge_area > 0:
+        info.append("✅ Maior bridge dentro do limite recomendado (≤30mm).")
+
+    printable = len(errors) == 0
+    summary = (
+        f"{'✅ Imprimível' if printable else '❌ Não imprimível'} "
+        f"({len(errors)} erro(s), {len(warnings_)} aviso(s))"
+    )
+
+    return {
+        "path": path,
+        "triangles": n_tri,
+        "vertices": n_vert,
+        "bbox": {"min": list(bbox_min), "max": list(bbox_max)},
+        "size": size_xyz,
+        "z_min": z_min_global,
+        "non_manifold_edges": non_manifold_edges,
+        "watertight": watertight,
+        "components": n_components,
+        "component_details": component_details,
+        "floating_components": floating,
+        "volume_mm3": volume_mm3,
+        "surface_mm2": surface_mm2,
+        "overhang": {
+            "convention": "0°=parede vertical, 90°=teto horizontal (ângulo a partir da vertical; angle=degrees(asin(-nz)))",
+            "threshold_deg": overhang_deg,
+            "down_facing_area_mm2": down_facing_area,
+            "overhang_area_mm2": overhang_area,
+            "overhang_pct": overhang_pct,
+            "worst_faces": [{"centroid": list(c), "angle_deg": a} for (_, c, a) in worst],
+        },
+        "bridges": {
+            "ceiling_threshold_deg": _MESH_CEILING_ANGLE_DEG,
+            "bridge_area_mm2": bridge_area,
+            "largest_cluster": largest_cluster,
+        },
+        "layer_h": layer_h,
+        "layers_estimate": round(size_xyz[2] / layer_h) if layer_h > 0 else None,
+        "errors": errors,
+        "warnings": warnings_,
+        "info": info,
+        "printable": printable,
+        "summary": summary,
+    }
+
+
+def _format_mesh_analysis(r: dict) -> str:
+    """Formata o dict de analyze_mesh() como texto legível (mesmo padrão de validate_printability)."""
+    watertight_line = "✅ sim" if r["watertight"] else f"❌ não ({r['non_manifold_edges']} arestas não-manifold)"
+    size_r = [round(s, 2) for s in r["size"]]
+
+    lines = [
+        f"🔍 Análise de Malha STL — {r['triangles']} triângulos, {r['vertices']} vértices únicos",
+        f"Resultado: {r['summary']}",
+        "",
+        f"📦 Bounding box: min={r['bbox']['min']} max={r['bbox']['max']} | tamanho={size_r}mm",
+        f"🧩 Componentes: {r['components']} ({r['floating_components']} flutuante(s))",
+        f"🔗 Watertight: {watertight_line}",
+        f"📐 Volume: {r['volume_mm3']:.2f}mm³ | Área de superfície: {r['surface_mm2']:.2f}mm²",
+        "",
+        f"⛰ Overhang — convenção: {r['overhang']['convention']}",
+        (
+            f"  Área voltada p/ baixo: {r['overhang']['down_facing_area_mm2']:.2f}mm² | "
+            f"Overhang > {r['overhang']['threshold_deg']}°: {r['overhang']['overhang_area_mm2']:.2f}mm² "
+            f"({r['overhang']['overhang_pct']:.1f}%)"
+        ),
+    ]
+    if r["overhang"]["worst_faces"]:
+        lines.append("  Piores faces (menor z):")
+        for wf in r["overhang"]["worst_faces"]:
+            c = wf["centroid"]
+            lines.append(f"    centroid=({c[0]:.1f}, {c[1]:.1f}, {c[2]:.1f}) ângulo={wf['angle_deg']:.1f}°")
+
+    lc = r["bridges"]["largest_cluster"]
+    lines.append("")
+    lines.append(f"🌉 Bridges (faces de teto > {r['bridges']['ceiling_threshold_deg']}° fora da base): "
+                 f"área total {r['bridges']['bridge_area_mm2']:.2f}mm²")
+    if lc:
+        lines.append(
+            f"  Maior vão: {lc['span_mm']:.1f}mm (bbox {[round(s,1) for s in lc['bbox_size']]}mm, {lc['triangles']} face(s))"
+        )
+
+    lines.append("")
+    if r["errors"]:
+        lines.append("❌ Erros:")
+        lines.extend(f"  {e}" for e in r["errors"])
+        lines.append("")
+    if r["warnings"]:
+        lines.append("⚠ Avisos:")
+        lines.extend(f"  {w}" for w in r["warnings"])
+        lines.append("")
+    if r["info"]:
+        lines.append("ℹ Info:")
+        lines.extend(f"  {i}" for i in r["info"])
+
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────
 # Registro das ferramentas MCP
 # ──────────────────────────────────────────────
 @server.list_tools()
@@ -2501,6 +2983,10 @@ async def handle_list_tools() -> list:
                         "type": "object",
                         "description": "Image size: width, height in pixels (default 800x600)"
                     },
+                    "timeout_s": {
+                        "type": "number",
+                        "description": "Render timeout in seconds (default 60, max 900)"
+                    },
                 },
                 "required": ["scad_code"]
             }
@@ -2513,7 +2999,11 @@ async def handle_list_tools() -> list:
                 "properties": {
                     "variables": {"type": "object"},
                     "scad_code": {"type": "string"},
-                    "output_path": {"type": "string"}
+                    "output_path": {"type": "string"},
+                    "timeout_s": {
+                        "type": "number",
+                        "description": "Render timeout in seconds (default 60, max 900)"
+                    },
                 },
                 "required": ["scad_code", "output_path"]
             }
@@ -2526,7 +3016,11 @@ async def handle_list_tools() -> list:
                 "properties": {
                     "variables": {"type": "object"},
                     "scad_code": {"type": "string"},
-                    "output_path": {"type": "string"}
+                    "output_path": {"type": "string"},
+                    "timeout_s": {
+                        "type": "number",
+                        "description": "Render timeout in seconds (default 60, max 900)"
+                    },
                 },
                 "required": ["scad_code", "output_path"]
             }
@@ -2539,7 +3033,11 @@ async def handle_list_tools() -> list:
                 "properties": {
                     "variables": {"type": "object"},
                     "scad_code": {"type": "string"},
-                    "output_path": {"type": "string"}
+                    "output_path": {"type": "string"},
+                    "timeout_s": {
+                        "type": "number",
+                        "description": "Render timeout in seconds (default 60, max 900)"
+                    },
                 },
                 "required": ["scad_code", "output_path"]
             }
@@ -2552,7 +3050,11 @@ async def handle_list_tools() -> list:
                 "properties": {
                     "variables": {"type": "object"},
                     "scad_code": {"type": "string"},
-                    "output_path": {"type": "string"}
+                    "output_path": {"type": "string"},
+                    "timeout_s": {
+                        "type": "number",
+                        "description": "Render timeout in seconds (default 60, max 900)"
+                    },
                 },
                 "required": ["scad_code", "output_path"]
             }
@@ -2963,6 +3465,49 @@ async def handle_list_tools() -> list:
                 "required": ["config"]
             }
         ),
+        # Análise de malha
+        types.Tool(
+            name="analyze_mesh",
+            description=(
+                "Analisa um arquivo STL (binário ou ASCII) ou código OpenSCAD para imprimibilidade 3D: "
+                "manifoldness (watertight), componentes desconexos/flutuantes, volume, área de superfície, "
+                "overhangs e bridges (vãos sem suporte). Análise 100% Python, sem dependências externas. "
+                "Aceita 'stl_path' (arquivo já existente) OU 'scad_code' (exporta STL internamente antes de analisar)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "stl_path": {
+                        "type": "string",
+                        "description": "Caminho para um arquivo .stl existente (alternativa a scad_code)"
+                    },
+                    "scad_code": {
+                        "type": "string",
+                        "description": "Código OpenSCAD a exportar (STL) e analisar (alternativa a stl_path)"
+                    },
+                    "variables": {
+                        "type": "object",
+                        "description": "Variáveis -D quando usando scad_code"
+                    },
+                    "timeout_s": {
+                        "type": "number",
+                        "description": "Timeout do export quando usando scad_code, em segundos (default 60, max 900)"
+                    },
+                    "overhang_deg": {
+                        "type": "number",
+                        "description": "Ângulo (a partir da vertical) considerado overhang crítico (default 45°)"
+                    },
+                    "bed_tol": {
+                        "type": "number",
+                        "description": "Tolerância em mm para considerar uma face 'na base' (default 0.3mm)"
+                    },
+                    "layer_h": {
+                        "type": "number",
+                        "description": "Altura de camada em mm, usada só para estimar o nº de camadas (default 0.2mm)"
+                    },
+                },
+            }
+        ),
     ]
 
 
@@ -3082,6 +3627,7 @@ async def handle_call_tool(
 
         scad_code = arguments["scad_code"]
         variables = arguments.get("variables", {})
+        timeout_s = arguments.get("timeout_s", RENDER_TIMEOUT_DEFAULT)
         extra_args = []
         for k, v in variables.items():
             if isinstance(v, str):
@@ -3120,7 +3666,7 @@ async def handle_call_tool(
 
             out_path = None
             try:
-                out_path, _ = await run_openscad(scad_code, "png", render_args)
+                out_path, _ = await run_openscad(scad_code, "png", render_args, timeout_s=timeout_s)
                 with open(out_path, "rb") as f:
                     img_data = base64.b64encode(f.read()).decode("utf-8")
                 return [
@@ -3142,7 +3688,7 @@ async def handle_call_tool(
             ext = name.split("_")[1]
             out_path = None
             try:
-                out_path, _ = await run_openscad(scad_code, ext, extra_args)
+                out_path, _ = await run_openscad(scad_code, ext, extra_args, timeout_s=timeout_s)
                 shutil.move(out_path, output_path)
                 return [types.TextContent(type="text", text=f"Exported successfully to {output_path}")]
             except Exception as e:
@@ -3444,6 +3990,49 @@ async def handle_call_tool(
 
         return [types.TextContent(type="text", text="\n".join(lines))]
 
+    elif name == "analyze_mesh":
+        stl_path = arguments.get("stl_path")
+        scad_code_mesh = arguments.get("scad_code")
+        if not stl_path and not scad_code_mesh:
+            raise ValueError("Forneça 'stl_path' ou 'scad_code'.")
+
+        overhang_deg = arguments.get("overhang_deg", 45.0)
+        bed_tol = arguments.get("bed_tol", 0.3)
+        layer_h = arguments.get("layer_h", 0.2)
+
+        tmp_generated = None
+        try:
+            if stl_path:
+                resolved_path = validate_output_path(stl_path)
+                if not os.path.isfile(resolved_path):
+                    raise ValueError(f"Arquivo STL não encontrado: {resolved_path}")
+                target_path = resolved_path
+            else:
+                variables = arguments.get("variables", {})
+                timeout_s = arguments.get("timeout_s", RENDER_TIMEOUT_DEFAULT)
+                extra_args = []
+                for k, v in variables.items():
+                    if isinstance(v, str):
+                        escaped_v = str(v).replace('"', '\\"')
+                        extra_args.extend(["-D", f'{k}="{escaped_v}"'])
+                    elif isinstance(v, bool):
+                        extra_args.extend(["-D", f'{k}={"true" if v else "false"}'])
+                    else:
+                        extra_args.extend(["-D", f"{k}={v}"])
+                target_path, _ = await run_openscad(scad_code_mesh, "stl", extra_args, timeout_s=timeout_s)
+                tmp_generated = target_path
+
+            result = analyze_mesh(target_path, overhang_deg=overhang_deg, bed_tol=bed_tol, layer_h=layer_h)
+            return [types.TextContent(type="text", text=_format_mesh_analysis(result))]
+        except Exception as e:
+            return [types.TextContent(type="text", text=f"❌ {e}")]
+        finally:
+            if tmp_generated and os.path.exists(tmp_generated):
+                try:
+                    os.remove(tmp_generated)
+                except Exception:
+                    pass
+
     else:
         raise ValueError(f"Unknown tool: {name}")
 
@@ -3455,7 +4044,7 @@ async def main():
             write_stream,
             InitializationOptions(
                 server_name="mcp-openscad",
-                server_version="0.5.0",
+                server_version="0.7.0",
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},
