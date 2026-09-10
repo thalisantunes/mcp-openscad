@@ -1,16 +1,16 @@
 # mcp-openscad
 
 ![CI](https://github.com/thalisantunes/mcp-openscad/actions/workflows/test.yml/badge.svg)
-![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Version](https://img.shields.io/badge/version-0.7.0-blue)
+![Version](https://img.shields.io/badge/version-0.8.0-blue)
 
 > Servidor MCP (Model Context Protocol) que permite agentes de IA interagir com o OpenSCAD para gerar, renderizar e exportar designs CAD paramétricos para fabricação digital — laser cutting, impressão 3D e CNC.
 
-## Versão atual: v0.7.0
+## Versão atual: v0.8.0
 
-### Ferramentas disponíveis (25)
+### Ferramentas disponíveis (26)
 
 #### Exportação Básica (6)
 | Ferramenta | Descrição |
@@ -56,10 +56,20 @@
 |---|---|
 | `generate_cnc_toolpath_hints` | Sugestões de parâmetros CNC (feed, RPM, DOC) por material e fresa |
 
-#### Análise (1)
+#### Análise (2)
 | Ferramenta | Descrição |
 |---|---|
 | `analyze_mesh` | Analisa STL (binário/ASCII) ou SCAD: watertight, componentes flutuantes, volume, overhang e bridges — 100% Python |
+| `mesh_section` | Corte transversal de STL/SCAD por um ou mais planos — fit-check de encaixes/press-fits (Ø externo/interno, parede, clearance) |
+
+## Skills
+
+Além das ferramentas MCP, este repositório inclui skills do Claude Code em
+[`skills/`](./skills):
+
+| Skill | Uso |
+|---|---|
+| [`3d-print-gate`](./skills/3d-print-gate/SKILL.md) | Gate de qualidade pré-slicing: roda `analyze_mesh` + `mesh_section` em cada peça/encaixe de uma peça ou pasta de STLs, com tabela pass/fail, antes de liberar para o slicer |
 
 ## Instalação
 
@@ -214,6 +224,19 @@ Ou direto a partir de código SCAD (exporta STL internamente antes de analisar):
 }
 ```
 
+### Corte transversal (fit-check de encaixe)
+```json
+{
+  "tool": "mesh_section",
+  "stl_path": "/tmp/tubo.stl",
+  "z_list": [5, 10, 15],
+  "axis": "z"
+}
+```
+Útil para comparar Ø externo de um pino com o Ø interno (bore) da peça fêmea
+correspondente na mesma altura de encaixe — ver a skill
+[`3d-print-gate`](./skills/3d-print-gate/SKILL.md).
+
 ### Timeout configurável de render
 `export_stl`, `export_3mf`, `export_dxf`, `export_svg` e `render_to_png` aceitam `timeout_s`
 (padrão 60s, limitado a [5, 900]s) para peças complexas que demoram mais para renderizar:
@@ -237,7 +260,7 @@ python -m pytest tests/ -v
 python -m pytest tests/ --cov=server --cov-report=term-missing
 ```
 
-Cobertura atual: **95%** — 274 testes.
+Cobertura atual: **94%** — 288 testes.
 
 ## Roadmap
 

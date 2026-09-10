@@ -3,12 +3,12 @@
 ## Projeto
 Servidor MCP para OpenSCAD — geração paramétrica de projetos para corte a laser, impressão 3D e CNC.
 
-- **Versão atual:** v0.7.0
+- **Versão atual:** v0.8.0
 - **Arquivo principal:** `server.py`
-- **Testes:** 274 testes · 95% cobertura
+- **Testes:** 288 testes · 94% cobertura
 - **CI:** GitHub Actions (lint + test)
 
-## Ferramentas disponíveis (25)
+## Ferramentas disponíveis (26)
 
 ### Export
 - `render_to_png` — Preview PNG de qualquer código SCAD
@@ -46,6 +46,10 @@ Servidor MCP para OpenSCAD — geração paramétrica de projetos para corte a l
 
 ### Análise
 - `analyze_mesh` — Analisa STL (binário/ASCII) ou SCAD para imprimibilidade: watertight, componentes flutuantes, volume, overhang e bridges (pura Python, sem numpy)
+- `mesh_section` — Corta STL/SCAD por plano(s) perpendiculares a x/y/z; retorna contornos, r_min/r_max e Ø externo/interno/parede — usado para fit-check de encaixes
+
+## Skills
+- `skills/3d-print-gate/` — gate de qualidade pré-slicing (roda `analyze_mesh` + `mesh_section` por peça/encaixe, tabela pass/fail); instalado via symlink em `~/.claude/skills/3d-print-gate`
 
 ## Como executar
 ```bash
@@ -74,6 +78,7 @@ Ver `ROADMAP.md` para o plano completo de versões.
 8. Manter commits semânticos (feat:, fix:, test:, docs:, refactor:)
 9. `run_openscad` aceita `timeout_s` (clamp [5, 900], default 60) — exposto como parâmetro opcional em `export_stl/3mf/dxf/svg` e `render_to_png`
 10. `analyze_mesh`/`_parse_stl` não usam numpy — mantenha a análise de malha em Python puro
+11. `analyze_mesh` e `mesh_section` compartilham a entrada `stl_path`/`scad_code` via `_resolve_stl_input()` — reaproveite esse helper para novas ferramentas baseadas em STL
 
 ## Próximas Prioridades
 - Sprint 3: Refatorar `handle_call_tool` (713 linhas → helper `_generate_and_export`)
