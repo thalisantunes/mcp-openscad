@@ -1,14 +1,15 @@
 """
-Testes do MCP-OpenSCAD — v0.3.0
+Testes do MCP-OpenSCAD — v0.5.0
 Cobre: run_openscad, check_syntax, todos os geradores, validadores e handlers MCP.
 """
 import os
 import sys
 import math
+import struct
 import pytest
 import subprocess
 import asyncio
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import server
@@ -18,49 +19,79 @@ import server
 # run_openscad
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_run_openscad_success():
+@pytest.mark.asyncio
+async def test_run_openscad_success():
     scad_code = "cube([10, 10, 10]);"
-    out_path, _ = server.run_openscad(scad_code, "stl")
+    out_path, _ = await server.run_openscad(scad_code, "stl")
     assert out_path.endswith(".stl")
     assert os.path.exists(out_path)
     os.remove(out_path)
 
 
-def test_run_openscad_error():
+@pytest.mark.asyncio
+async def test_run_openscad_error():
     with pytest.raises(RuntimeError, match="OpenSCAD Error"):
-        server.run_openscad("invalid_syntax_xyz();", "stl")
+        await server.run_openscad("invalid_syntax_xyz();", "stl")
 
 
-@patch('subprocess.run')
-def test_run_openscad_timeout(mock_run):
-    mock_run.side_effect = subprocess.TimeoutExpired(cmd="openscad", timeout=60)
-    with pytest.raises(RuntimeError, match="Execution timed out after 60 seconds"):
-        server.run_openscad("cube();", "stl")
+@pytest.mark.asyncio
+async def test_run_openscad_timeout():
+    """Guard: timeout de 60s deve levantar RuntimeError."""
+    async def slow_communicate():
+        await asyncio.sleep(100)
+        return b"", b""
+
+    mock_proc = MagicMock()
+    mock_proc.communicate = slow_communicate
+    mock_proc.kill = MagicMock()
+
+    async def mock_create_subprocess(*args, **kwargs):
+        return mock_proc
+
+    with patch('asyncio.create_subprocess_exec', side_effect=mock_create_subprocess):
+        with pytest.raises(RuntimeError, match="timed out after 60 seconds"):
+            await server.run_openscad("cube();", "stl")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # check_scad_syntax
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_check_syntax_valid():
-    is_valid, msg = server.check_scad_syntax("cube([10,10,10]);")
-    assert is_valid
+@pytest.mark.asyncio
+async def test_check_syntax_valid():
+    is_valid, msg = await server.check_scad_syntax("cube([10,10,10]);")
+    assert is_valid is True
     assert "válida" in msg or "valid" in msg.lower() or "✅" in msg
 
 
-def test_check_syntax_invalid():
-    is_valid, msg = server.check_scad_syntax("XYZINVALIDKEYWORD(;;;)")
-    # Pode ser inválido ou válido dependendo do OpenSCAD — só verificamos que retorna
+@pytest.mark.asyncio
+async def test_check_syntax_invalid():
+    is_valid, msg = await server.check_scad_syntax("XYZINVALIDKEYWORD(;;;)")
+    # OpenSCAD pode retornar erro ou aviso — verificamos que é inválido OU string não vazia
     assert isinstance(is_valid, bool)
     assert isinstance(msg, str)
+    assert len(msg) > 0
 
 
-@patch('subprocess.run')
-def test_check_syntax_timeout(mock_run):
-    mock_run.side_effect = subprocess.TimeoutExpired(cmd="openscad", timeout=15)
-    is_valid, msg = server.check_scad_syntax("cube([1,1,1]);")
+@pytest.mark.asyncio
+async def test_check_syntax_timeout():
+    """Guard: timeout de 15s deve retornar (False, msg_timeout)."""
+    async def slow_communicate():
+        await asyncio.sleep(100)
+        return b"", b""
+
+    mock_proc = MagicMock()
+    mock_proc.communicate = slow_communicate
+    mock_proc.kill = MagicMock()
+
+    async def mock_create_subprocess(*args, **kwargs):
+        return mock_proc
+
+    with patch('asyncio.create_subprocess_exec', side_effect=mock_create_subprocess):
+        is_valid, msg = await server.check_scad_syntax("cube([1,1,1]);")
     assert not is_valid
     assert "Timeout" in msg or "timeout" in msg.lower()
+    assert "timeout" in msg.lower()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,6 +102,7 @@ def test_validate_config_clean():
     cfg = {"width": 100, "depth": 80, "height": 50}
     warns = server.validate_config(cfg)
     assert isinstance(warns, list)
+    assert len(warns) == 0
 
 
 def test_validate_config_opening_out_of_bounds():
@@ -99,6 +131,7 @@ def test_validate_box_config_ok():
     cfg = {"width": 100, "depth": 80, "height": 50, "fingers": 5}
     warns = server.validate_box_config(cfg)
     assert isinstance(warns, list)
+    assert len(warns) == 0  # Configuração válida não deve ter avisos
 
 
 def test_validate_box_config_even_fingers():
@@ -533,7 +566,22 @@ async def test_handle_list_tools():
     assert "generate_assembly"          in tool_names
     # CNC
     assert "generate_cnc_toolpath_hints" in tool_names
-    assert len(tools) == 24
+    # Análise
+    assert "analyze_mesh" in tool_names
+    assert len(tools) == 25
+
+    mesh_tool = next(t for t in tools if t.name == "analyze_mesh")
+    props = mesh_tool.inputSchema["properties"]
+    assert "stl_path" in props
+    assert "scad_code" in props
+    assert "overhang_deg" in props
+    assert "bed_tol" in props
+    assert "layer_h" in props
+    assert "timeout_s" in props
+
+    for export_tool in ("render_to_png", "export_stl", "export_3mf", "export_dxf", "export_svg"):
+        t = next(t for t in tools if t.name == export_tool)
+        assert "timeout_s" in t.inputSchema["properties"]
 
 
 @pytest.mark.asyncio
@@ -756,46 +804,51 @@ async def test_generate_kerf_test_missing_args():
 # Testes de integração OpenSCAD (render real)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_openscad_renders_box():
+@pytest.mark.asyncio
+async def test_openscad_renders_box():
     """Integração: gera SCAD de caixa e renderiza para PNG via OpenSCAD real."""
     cfg = {"width": 80, "depth": 60, "height": 40}
     scad = server.generate_box_scad(cfg)
-    out_path, _ = server.run_openscad(scad, "png", ["--autocenter", "--viewall"])
+    out_path, _ = await server.run_openscad(scad, "png", ["--autocenter", "--viewall"])
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 1000  # PNG não vazio
     os.remove(out_path)
 
 
-def test_openscad_renders_3d_box():
+@pytest.mark.asyncio
+async def test_openscad_renders_3d_box():
     """Integração: gera SCAD 3D e renderiza STL."""
     cfg = {"width": 50, "depth": 40, "height": 30, "lid_type": "none"}
     scad = server.generate_3d_box_scad(cfg)
-    out_path, _ = server.run_openscad(scad, "stl")
+    out_path, _ = await server.run_openscad(scad, "stl")
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 100
     os.remove(out_path)
 
 
-def test_openscad_renders_bracket():
+@pytest.mark.asyncio
+async def test_openscad_renders_bracket():
     """Integração: gera suporte em L e renderiza STL."""
     cfg = {"type": "L", "width": 30, "height": 30, "depth": 15, "gusset": False}
     scad = server.generate_bracket_scad(cfg)
-    out_path, _ = server.run_openscad(scad, "stl")
+    out_path, _ = await server.run_openscad(scad, "stl")
     assert os.path.exists(out_path)
     os.remove(out_path)
 
 
-def test_openscad_renders_kerf_test_svg():
+@pytest.mark.asyncio
+async def test_openscad_renders_kerf_test_svg():
     """Integração: gera placa de kerf e exporta SVG."""
     cfg = {"material_thickness": 3, "kerf_min": 0.1, "kerf_max": 0.3, "kerf_step": 0.1}
     scad = server.generate_kerf_test_scad(cfg)
-    out_path, _ = server.run_openscad(scad, "svg")
+    out_path, _ = await server.run_openscad(scad, "svg")
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 100
     os.remove(out_path)
 
 
-def test_openscad_renders_enclosure():
+@pytest.mark.asyncio
+async def test_openscad_renders_enclosure():
     """Integração: gera gabinete e renderiza STL."""
     cfg = {
         "width": 100, "depth": 60, "height": 30, "wall": 2.5,
@@ -803,37 +856,40 @@ def test_openscad_renders_enclosure():
         "pcb_standoffs": [{"x": 10, "y": 10}, {"x": 90, "y": 50}]
     }
     scad = server.generate_enclosure_scad(cfg)
-    out_path, _ = server.run_openscad(scad, "stl")
+    out_path, _ = await server.run_openscad(scad, "stl")
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 100
     os.remove(out_path)
 
 
-def test_openscad_renders_laser_2d():
+@pytest.mark.asyncio
+async def test_openscad_renders_laser_2d():
     """Integração: gera laser_part e exporta SVG 2D."""
     cfg = {"width": 80, "depth": 60, "height": 40}
     scad = server.generate_laser_scad(cfg)
     scad_2d = scad.replace('RENDER_MODE = "3d"', 'RENDER_MODE = "2d"')
-    out_path, _ = server.run_openscad(scad_2d, "svg")
+    out_path, _ = await server.run_openscad(scad_2d, "svg")
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 100
     os.remove(out_path)
 
 
-def test_openscad_renders_finger_test():
+@pytest.mark.asyncio
+async def test_openscad_renders_finger_test():
     """Integração: gera finger test e exporta SVG."""
     cfg = {"material_thickness": 3, "offset_min": 0.0, "offset_max": 0.1, "offset_step": 0.1}
     scad = server.generate_finger_test_scad(cfg)
-    out_path, _ = server.run_openscad(scad, "svg")
+    out_path, _ = await server.run_openscad(scad, "svg")
     assert os.path.exists(out_path)
     os.remove(out_path)
 
 
-def test_openscad_renders_3d_box_with_lid():
+@pytest.mark.asyncio
+async def test_openscad_renders_3d_box_with_lid():
     """Integração: gera caixa 3D com tampa snap e renderiza STL."""
     cfg = {"width": 60, "depth": 40, "height": 30, "lid_type": "snap"}
     scad = server.generate_3d_box_scad(cfg)
-    out_path, _ = server.run_openscad(scad, "stl")
+    out_path, _ = await server.run_openscad(scad, "stl")
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 100
     os.remove(out_path)
@@ -1307,31 +1363,34 @@ async def test_generate_retraction_test_missing_args():
 # Integração OpenSCAD — novos geradores v0.4.0
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_openscad_renders_tolerance_test():
+@pytest.mark.asyncio
+async def test_openscad_renders_tolerance_test():
     """Integração: gera placa de tolerância e renderiza STL."""
     cfg = {"tol_min": 0.0, "tol_max": 0.1, "tol_step": 0.1}
     scad = server.generate_tolerance_test_scad(cfg)
-    out_path, _ = server.run_openscad(scad, "stl")
+    out_path, _ = await server.run_openscad(scad, "stl")
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 100
     os.remove(out_path)
 
 
-def test_openscad_renders_bed_level_test():
+@pytest.mark.asyncio
+async def test_openscad_renders_bed_level_test():
     """Integração: gera teste de nivelamento e renderiza STL."""
     cfg = {"grid_cols": 2, "grid_rows": 2, "bed_x": 100, "bed_y": 100}
     scad = server.generate_bed_level_test_scad(cfg)
-    out_path, _ = server.run_openscad(scad, "stl")
+    out_path, _ = await server.run_openscad(scad, "stl")
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 100
     os.remove(out_path)
 
 
-def test_openscad_renders_retraction_test():
+@pytest.mark.asyncio
+async def test_openscad_renders_retraction_test():
     """Integração: gera torre de retração e renderiza STL."""
     cfg = {"tower_count": 2, "tower_h": 20}
     scad = server.generate_retraction_test_scad(cfg)
-    out_path, _ = server.run_openscad(scad, "stl")
+    out_path, _ = await server.run_openscad(scad, "stl")
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 100
     os.remove(out_path)
@@ -1508,21 +1567,23 @@ async def test_generate_dogbone_missing_args():
 # Integração OpenSCAD — living hinge + dogbone
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_openscad_renders_living_hinge_svg():
+@pytest.mark.asyncio
+async def test_openscad_renders_living_hinge_svg():
     """Integração: gera living hinge e exporta SVG."""
     cfg = {"width": 80, "height": 50, "pattern": "straight"}
     scad = server.generate_living_hinge_scad(cfg)
-    out_path, _ = server.run_openscad(scad, "svg")
+    out_path, _ = await server.run_openscad(scad, "svg")
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 100
     os.remove(out_path)
 
 
-def test_openscad_renders_dogbone_svg():
+@pytest.mark.asyncio
+async def test_openscad_renders_dogbone_svg():
     """Integração: gera dogbone pocket e exporta SVG."""
     cfg = {"width": 50, "height": 30, "corner_style": "dogbone"}
     scad = server.generate_dogbone_scad(cfg)
-    out_path, _ = server.run_openscad(scad, "svg")
+    out_path, _ = await server.run_openscad(scad, "svg")
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 100
     os.remove(out_path)
@@ -1713,7 +1774,8 @@ async def test_generate_assembly_missing_args():
 # Integração: suggest_orientation + assembly
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_openscad_renders_assembly():
+@pytest.mark.asyncio
+async def test_openscad_renders_assembly():
     """Integração: assembly gera SCAD válido que renderiza em STL."""
     cfg = {
         "pieces": [
@@ -1723,7 +1785,7 @@ def test_openscad_renders_assembly():
         ]
     }
     scad, _, _ = server.generate_assembly_scad(cfg)
-    out_path, _ = server.run_openscad(scad, "stl")
+    out_path, _ = await server.run_openscad(scad, "stl")
     assert os.path.exists(out_path)
     assert os.path.getsize(out_path) > 100
     os.remove(out_path)
@@ -2146,4 +2208,507 @@ def test_validate_assembly_params():
     # color boundaries
     with pytest.raises(ValueError, match="Color channel values must be between 0 and 1"):
         server.validate_config_parameters("generate_assembly", {"pieces": [{"name": "a", "color": [1.5, 0, 0]}]})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sprint 4: Testes novos cobrindo gaps críticos identificados na auditoria
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Segurança: import()/surface() em SCAD customizado ────────────────────────
+
+def test_verify_safety_guidelines_blocks_import():
+    """Segurança: import() deve ser bloqueado em custom SCAD."""
+    with pytest.raises(ValueError, match="Safety violation"):
+        server.verify_safety_guidelines('import("/etc/passwd");')
+
+
+def test_verify_safety_guidelines_blocks_surface():
+    """Segurança: surface() deve ser bloqueado em custom SCAD."""
+    with pytest.raises(ValueError, match="Safety violation"):
+        server.verify_safety_guidelines('surface("/etc/shadow");')
+
+
+def test_verify_safety_guidelines_allows_import_word_in_comment():
+    """Segurança: 'import' como parte de nome não deve ser bloqueado."""
+    # 'import_size' não tem 'import(' então deve passar
+    server.verify_safety_guidelines("import_size = 10; cube([import_size, 10, 10]);")
+
+
+# ── Segurança: MCP_OPENSCAD_ALLOWED_PATHS env var ────────────────────────────
+
+def test_validate_output_path_uses_env_var(monkeypatch):
+    """Segurança: MCP_OPENSCAD_ALLOWED_PATHS env var deve ser respeitada."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        monkeypatch.setenv("MCP_OPENSCAD_ALLOWED_PATHS", tmpdir)
+        result = server.validate_output_path(os.path.join(tmpdir, "test.scad"))
+        assert result.startswith(tmpdir)
+
+
+def test_validate_output_path_env_var_blocks_outside(monkeypatch):
+    """Segurança: path fora de MCP_OPENSCAD_ALLOWED_PATHS deve ser bloqueado."""
+    monkeypatch.setenv("MCP_OPENSCAD_ALLOWED_PATHS", "/some/allowed/path")
+    with pytest.raises(ValueError, match="Access denied"):
+        server.validate_output_path("/tmp/test.scad")
+
+
+# ── Kerf: guard contra kerf negativo ─────────────────────────────────────────
+
+def test_generate_laser_scad_kerf_guard_thin_material():
+    """Guard: kerf não deve ficar negativo com material fino."""
+    cfg = {"material_thickness": 0.05, "kerf": 0.5}
+    scad = server.generate_laser_scad(cfg)
+    # Se chegou aqui sem exceção, o guard funcionou
+    assert "module" in scad
+
+
+def test_generate_box_scad_kerf_guard_thin_material():
+    """Guard: kerf não deve ficar negativo em generate_box_scad com material fino."""
+    cfg = {"material_thickness": 0.05, "kerf": 0.5}
+    scad = server.generate_box_scad(cfg)
+    assert "module" in scad
+
+
+# ── CNC: divisão por zero com tool_d=0 e tool_flutes=0 ───────────────────────
+
+def test_validate_config_parameters_cnc_tool_d_zero():
+    """CNC: tool_d=0 deve levantar ValueError."""
+    with pytest.raises(ValueError):
+        server.validate_config_parameters("generate_cnc_toolpath_hints", {"tool_d": 0})
+
+
+def test_validate_config_parameters_cnc_tool_flutes_zero():
+    """CNC: tool_flutes=0 deve levantar ValueError (min=1)."""
+    with pytest.raises(ValueError):
+        server.validate_config_parameters("generate_cnc_toolpath_hints", {"tool_flutes": 0})
+
+
+def test_validate_config_parameters_cnc_negative_thickness():
+    """CNC: material_thickness negativo deve levantar ValueError."""
+    with pytest.raises(ValueError):
+        server.validate_config_parameters("generate_cnc_toolpath_hints", {"material_thickness": -1})
+
+
+# ── Assembly: edge cases ──────────────────────────────────────────────────────
+
+def test_generate_assembly_empty_pieces():
+    """Assembly: lista de peças vazia usa peças padrão."""
+    cfg = {"pieces": []}
+    scad, pieces, bom = server.generate_assembly_scad(cfg)
+    # Com lista vazia, deve usar peças padrão (5 peças)
+    assert len(pieces) == 5
+
+
+def test_generate_assembly_piece_with_rotate():
+    """Assembly: peça com rotate deve incluir rotate() no SCAD."""
+    cfg = {"pieces": [{"name": "part", "w": 20, "d": 10, "h": 5, "rotate": [0, 0, 45]}]}
+    scad, pieces, _ = server.generate_assembly_scad(cfg)
+    assert "rotate" in scad
+
+
+def test_generate_assembly_piece_with_color():
+    """Assembly: peça com color deve incluir color() no SCAD."""
+    cfg = {"pieces": [{"name": "colorful", "w": 20, "d": 10, "h": 5, "color": [1, 0, 0]}]}
+    scad, pieces, _ = server.generate_assembly_scad(cfg)
+    assert "color" in scad
+
+
+def test_generate_assembly_duplicate_piece_names():
+    """Assembly: peças com nomes duplicados devem ser geradas (último vence no dict)."""
+    cfg = {"pieces": [
+        {"name": "part", "w": 10, "d": 10, "h": 10},
+        {"name": "part", "w": 20, "d": 20, "h": 20},
+    ]}
+    scad, pieces, _ = server.generate_assembly_scad(cfg)
+    # Funciona sem exceção — o dict terá 1 entrada (último valor)
+    assert "part" in pieces
+
+
+# ── Material thickness zero / nan / inf ──────────────────────────────────────
+
+def test_validate_config_parameters_nan_value():
+    """Validação: float('nan') deve ser rejeitado."""
+    with pytest.raises(ValueError):
+        server.validate_config_parameters("generate_laser_part", {"width": float("nan")})
+
+
+def test_validate_config_parameters_inf_value():
+    """Validação: float('inf') deve ser rejeitado."""
+    with pytest.raises(ValueError):
+        server.validate_config_parameters("generate_laser_part", {"width": float("inf")})
+
+
+def test_validate_config_parameters_material_thickness_zero():
+    """Validação: material_thickness=0 deve ser rejeitado."""
+    with pytest.raises(ValueError):
+        server.validate_config_parameters("generate_laser_part", {"material_thickness": 0})
+
+
+# ── safe_output_path: string vazia ───────────────────────────────────────────
+
+def test_safe_output_path_empty_project_name():
+    """Segurança: project_name vazio deve resultar em nome padrão 'project'."""
+    out_dir, proj = server.safe_output_path("/tmp/test", "")
+    assert proj == "project"
+
+
+def test_safe_output_path_only_dots():
+    """Segurança: project_name '...' deve resultar em nome padrão."""
+    _, proj = server.safe_output_path("/tmp/test", "...")
+    assert proj not in (".", "..", "...")
+
+
+# ── Volume cilindro no BOM ────────────────────────────────────────────────────
+
+def test_generate_assembly_bom_cylinder_volume():
+    """BOM: volume de cilindro deve ser calculado (verificar que BOM não está vazio)."""
+    cfg = {"pieces": [{"name": "cyl", "type": "cylinder", "w": 10, "h": 20}]}
+    _, _, bom = server.generate_assembly_scad(cfg)
+    assert "cyl" in bom
+    assert "Volume" in bom or "volume" in bom.lower() or "mm³" in bom
+
+
+# ── _generate_and_export helper ───────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_generate_and_export_helper(tmp_path):
+    """Sprint 3: helper _generate_and_export deve salvar SCAD e retornar resultado."""
+    scad = "cube([10,10,10]);"
+    results = ["✅ Teste"]
+    ret = await server._generate_and_export(
+        scad, str(tmp_path), "test_cube", results,
+        export_formats=[("stl", "📐 STL")]
+    )
+    assert len(ret) >= 1
+    assert os.path.exists(str(tmp_path / "test_cube.scad"))
+
+
+@pytest.mark.asyncio
+async def test_generate_and_export_helper_with_scad_2d(tmp_path):
+    """Sprint 3: helper _generate_and_export com scad_2d alternativo."""
+    scad_3d = "cube([20,20,20]);"
+    scad_2d = "square([20,20]);"
+    results = ["✅ Laser test"]
+    ret = await server._generate_and_export(
+        scad_3d, str(tmp_path), "laser_test", results,
+        export_formats=[("svg", "🖼 SVG")],
+        scad_2d=scad_2d
+    )
+    assert len(ret) >= 1
+
+
+# ── README.md: versão atualizada ─────────────────────────────────────────────
+
+def test_readme_has_version_badge():
+    """Documentação: README deve ter badge de versão."""
+    readme = os.path.join(os.path.dirname(__file__), '..', 'README.md')
+    with open(readme) as f:
+        content = f.read()
+    assert "version" in content.lower() or "badge" in content.lower()
+
+
+# ── CHANGELOG.md: existência ─────────────────────────────────────────────────
+
+def test_changelog_exists():
+    """Documentação: CHANGELOG.md deve existir."""
+    changelog = os.path.join(os.path.dirname(__file__), '..', 'CHANGELOG.md')
+    assert os.path.exists(changelog), "CHANGELOG.md não encontrado"
+    with open(changelog) as f:
+        content = f.read()
+    assert "0.5.0" in content or "0.4.0" in content
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# run_openscad: timeout configurável (v0.7.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_clamp_timeout_within_range():
+    assert server._clamp_timeout(120) == 120
+    assert server._clamp_timeout(120.5) == 120.5
+
+
+def test_clamp_timeout_below_min():
+    assert server._clamp_timeout(1) == server.RENDER_TIMEOUT_MIN
+    assert server._clamp_timeout(-5) == server.RENDER_TIMEOUT_MIN
+
+
+def test_clamp_timeout_above_max():
+    assert server._clamp_timeout(99999) == server.RENDER_TIMEOUT_MAX
+
+
+def test_clamp_timeout_invalid_falls_back_to_default():
+    assert server._clamp_timeout("not-a-number") == server.RENDER_TIMEOUT_DEFAULT
+    assert server._clamp_timeout(None) == server.RENDER_TIMEOUT_DEFAULT
+    assert server._clamp_timeout(float("nan")) == server.RENDER_TIMEOUT_DEFAULT
+    assert server._clamp_timeout(float("inf")) == server.RENDER_TIMEOUT_DEFAULT
+
+
+@pytest.mark.asyncio
+async def test_run_openscad_timeout_message_includes_clamped_value_high():
+    """timeout_s acima do máximo deve ser clampado e refletido na mensagem de erro."""
+    mock_proc = MagicMock()
+    mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+    mock_proc.kill = MagicMock()
+
+    async def mock_create_subprocess(*a, **kw):
+        return mock_proc
+
+    async def _immediate_timeout(coro, timeout):
+        coro.close()
+        raise asyncio.TimeoutError()
+
+    with patch('asyncio.create_subprocess_exec', side_effect=mock_create_subprocess), \
+         patch('asyncio.wait_for', side_effect=_immediate_timeout):
+        with pytest.raises(RuntimeError, match="timed out after 900 seconds"):
+            await server.run_openscad("cube();", "stl", timeout_s=999999)
+
+
+@pytest.mark.asyncio
+async def test_run_openscad_timeout_message_includes_clamped_value_low():
+    """timeout_s abaixo do mínimo deve ser clampado e refletido na mensagem de erro."""
+    mock_proc = MagicMock()
+    mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+    mock_proc.kill = MagicMock()
+
+    async def mock_create_subprocess(*a, **kw):
+        return mock_proc
+
+    async def _immediate_timeout(coro, timeout):
+        coro.close()
+        raise asyncio.TimeoutError()
+
+    with patch('asyncio.create_subprocess_exec', side_effect=mock_create_subprocess), \
+         patch('asyncio.wait_for', side_effect=_immediate_timeout):
+        with pytest.raises(RuntimeError, match="timed out after 5 seconds"):
+            await server.run_openscad("cube();", "stl", timeout_s=1)
+
+
+@pytest.mark.asyncio
+async def test_run_openscad_custom_timeout_used():
+    """asyncio.wait_for deve receber o timeout_s (clampado) explicitamente passado."""
+    mock_proc = MagicMock()
+    mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+    async def mock_create_subprocess(*a, **kw):
+        return mock_proc
+
+    captured = {}
+
+    async def fake_wait_for(coro, timeout):
+        captured["timeout"] = timeout
+        coro.close()
+        return b"", b""
+
+    with patch('asyncio.create_subprocess_exec', side_effect=mock_create_subprocess), \
+         patch('asyncio.wait_for', side_effect=fake_wait_for):
+        # returncode != 0 sem out_path existente levantaria erro; simulamos sucesso
+        mock_proc.returncode = 0
+        out_path, _ = await server.run_openscad("cube([1,1,1]);", "stl", timeout_s=120)
+    assert captured["timeout"] == 120
+    if os.path.exists(out_path):
+        os.remove(out_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# analyze_mesh: helpers de STL sintético para os testes
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _box_triangles(origin=(0.0, 0.0, 0.0), size=(10.0, 10.0, 10.0)):
+    """Gera os 12 triângulos de uma caixa fechada, com winding CCW-de-fora
+    (normais para fora), a partir de origin (canto min) e size (dx,dy,dz)."""
+    ox, oy, oz = origin
+    sx, sy, sz = size
+    v = [
+        (ox, oy, oz), (ox + sx, oy, oz), (ox + sx, oy + sy, oz), (ox, oy + sy, oz),
+        (ox, oy, oz + sz), (ox + sx, oy, oz + sz), (ox + sx, oy + sy, oz + sz), (ox, oy + sy, oz + sz),
+    ]
+    faces = [
+        (0, 4, 7), (0, 7, 3),  # -X
+        (1, 2, 6), (1, 6, 5),  # +X
+        (0, 1, 5), (0, 5, 4),  # -Y
+        (3, 7, 6), (3, 6, 2),  # +Y
+        (0, 2, 1), (0, 3, 2),  # -Z
+        (4, 5, 6), (4, 6, 7),  # +Z
+    ]
+    return [(v[a], v[b], v[c]) for a, b, c in faces]
+
+
+def _write_binary_stl(path, triangles):
+    with open(path, "wb") as f:
+        f.write(b"\x00" * 80)
+        f.write(struct.pack("<I", len(triangles)))
+        for v1, v2, v3 in triangles:
+            f.write(struct.pack("<3f", 0.0, 0.0, 0.0))
+            f.write(struct.pack("<3f", *v1))
+            f.write(struct.pack("<3f", *v2))
+            f.write(struct.pack("<3f", *v3))
+            f.write(struct.pack("<H", 0))
+
+
+def _write_ascii_stl(path, triangles):
+    lines = ["solid test"]
+    for v1, v2, v3 in triangles:
+        lines.append("  facet normal 0 0 0")
+        lines.append("    outer loop")
+        for v in (v1, v2, v3):
+            lines.append(f"      vertex {v[0]} {v[1]} {v[2]}")
+        lines.append("    endloop")
+        lines.append("  endfacet")
+    lines.append("endsolid test")
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# analyze_mesh: parsing + geometria
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_analyze_mesh_closed_cube_binary_watertight(tmp_path):
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube.stl"
+    _write_binary_stl(str(p), tris)
+
+    r = server.analyze_mesh(str(p))
+    assert r["triangles"] == 12
+    assert r["vertices"] == 8
+    assert r["non_manifold_edges"] == 0
+    assert r["watertight"] is True
+    assert r["components"] == 1
+    assert r["floating_components"] == 0
+    assert r["volume_mm3"] == pytest.approx(1000.0, rel=1e-3)
+    assert r["surface_mm2"] == pytest.approx(600.0, rel=1e-3)
+    assert r["printable"] is True
+    assert "summary" in r
+
+
+def test_analyze_mesh_closed_cube_ascii_matches_binary(tmp_path):
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube_ascii.stl"
+    _write_ascii_stl(str(p), tris)
+
+    r = server.analyze_mesh(str(p))
+    assert r["triangles"] == 12
+    assert r["vertices"] == 8
+    assert r["watertight"] is True
+    assert r["volume_mm3"] == pytest.approx(1000.0, rel=1e-3)
+
+
+def test_analyze_mesh_open_cube_non_manifold(tmp_path):
+    """Cubo com uma face faltando: 4 arestas de borda ficam com contagem 1."""
+    tris = _box_triangles(size=(10, 10, 10))
+    # Remove a face +Z (últimos 2 triângulos)
+    tris_open = tris[:-2]
+    p = tmp_path / "open_cube.stl"
+    _write_binary_stl(str(p), tris_open)
+
+    r = server.analyze_mesh(str(p))
+    assert r["non_manifold_edges"] == 4
+    assert r["watertight"] is False
+    assert r["printable"] is False
+    assert any("watertight" in e.lower() or "manifold" in e.lower() for e in r["errors"])
+
+
+def test_analyze_mesh_two_components_one_floating(tmp_path):
+    tris = _box_triangles(origin=(0, 0, 0), size=(10, 10, 10))
+    tris += _box_triangles(origin=(30, 0, 5), size=(10, 10, 10))
+    p = tmp_path / "two_cubes.stl"
+    _write_binary_stl(str(p), tris)
+
+    r = server.analyze_mesh(str(p), bed_tol=0.3)
+    assert r["components"] == 2
+    assert r["floating_components"] == 1
+    assert r["printable"] is False
+
+
+def test_analyze_mesh_overhang_wedge_detected(tmp_path):
+    """Face única inclinada > 45° a partir da vertical, elevada acima da base."""
+    tri = [(
+        (0.0, 0.0, 5.0),
+        (0.0, 10.0, 5.0),
+        (10.0, 10.0, 0.0),
+    )]
+    p = tmp_path / "wedge.stl"
+    _write_binary_stl(str(p), tri)
+
+    r = server.analyze_mesh(str(p), overhang_deg=45)
+    assert r["overhang"]["overhang_area_mm2"] > 0
+    assert len(r["overhang"]["worst_faces"]) >= 1
+    assert r["overhang"]["worst_faces"][0]["angle_deg"] > 45
+
+
+def test_analyze_mesh_table_bridge_detected(tmp_path):
+    """Slab elevado sobre uma perna: face de baixo do slab é um bridge > 30mm."""
+    tris = _box_triangles(origin=(0, 0, 0), size=(5, 5, 20))          # perna, toca a base
+    tris += _box_triangles(origin=(-20, -20, 20), size=(50, 50, 2))   # slab elevado
+    p = tmp_path / "table.stl"
+    _write_binary_stl(str(p), tris)
+
+    r = server.analyze_mesh(str(p), bed_tol=0.3)
+    assert r["bridges"]["bridge_area_mm2"] > 0
+    assert r["bridges"]["largest_cluster"] is not None
+    assert r["bridges"]["largest_cluster"]["span_mm"] > 30
+    assert any("bridge" in w.lower() or "vão" in w.lower() for w in r["warnings"])
+
+
+def test_analyze_mesh_empty_stl_raises(tmp_path):
+    p = tmp_path / "empty.stl"
+    _write_binary_stl(str(p), [])
+    with pytest.raises(ValueError, match="não contém triângulos"):
+        server.analyze_mesh(str(p))
+
+
+def test_analyze_mesh_triangle_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "STL_MAX_TRIANGLES", 5)
+    tris = _box_triangles(size=(10, 10, 10))  # 12 triângulos > cap de 5
+    p = tmp_path / "toobig.stl"
+    _write_binary_stl(str(p), tris)
+    with pytest.raises(ValueError, match="acima do limite"):
+        server.analyze_mesh(str(p))
+
+
+def test_format_mesh_analysis_returns_string(tmp_path):
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube.stl"
+    _write_binary_stl(str(p), tris)
+    r = server.analyze_mesh(str(p))
+    text = server._format_mesh_analysis(r)
+    assert isinstance(text, str)
+    assert "Imprimível" in text or "imprimível" in text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# analyze_mesh: handler MCP (handle_call_tool)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_analyze_mesh_stl_path(tmp_path):
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube.stl"
+    _write_binary_stl(str(p), tris)
+
+    ret = await server.handle_call_tool("analyze_mesh", {"stl_path": str(p)})
+    assert len(ret) == 1
+    assert "Imprimível" in ret[0].text or "imprimível" in ret[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_analyze_mesh_missing_input():
+    with pytest.raises(ValueError, match="stl_path.*scad_code|scad_code.*stl_path"):
+        await server.handle_call_tool("analyze_mesh", {})
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_analyze_mesh_nonexistent_path(tmp_path):
+    missing = tmp_path / "does_not_exist.stl"
+    ret = await server.handle_call_tool("analyze_mesh", {"stl_path": str(missing)})
+    assert len(ret) == 1
+    assert "não encontrado" in ret[0].text or "❌" in ret[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_analyze_mesh_from_scad_code():
+    ret = await server.handle_call_tool("analyze_mesh", {"scad_code": "cube([10,10,10]);"})
+    assert len(ret) == 1
+    assert "triângulos" in ret[0].text
+
 

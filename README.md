@@ -1,10 +1,16 @@
 # mcp-openscad
 
+![CI](https://github.com/thalisantunes/mcp-openscad/actions/workflows/test.yml/badge.svg)
+![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Version](https://img.shields.io/badge/version-0.7.0-blue)
+
 > Servidor MCP (Model Context Protocol) que permite agentes de IA interagir com o OpenSCAD para gerar, renderizar e exportar designs CAD paramétricos para fabricação digital — laser cutting, impressão 3D e CNC.
 
-## Versão atual: v0.4.0
+## Versão atual: v0.7.0
 
-### Ferramentas disponíveis (24)
+### Ferramentas disponíveis (25)
 
 #### Exportação Básica (6)
 | Ferramenta | Descrição |
@@ -49,6 +55,11 @@
 | Ferramenta | Descrição |
 |---|---|
 | `generate_cnc_toolpath_hints` | Sugestões de parâmetros CNC (feed, RPM, DOC) por material e fresa |
+
+#### Análise (1)
+| Ferramenta | Descrição |
+|---|---|
+| `analyze_mesh` | Analisa STL (binário/ASCII) ou SCAD: watertight, componentes flutuantes, volume, overhang e bridges — 100% Python |
 
 ## Instalação
 
@@ -185,6 +196,36 @@ python server.py
 }
 ```
 
+### Análise de malha (imprimibilidade)
+```json
+{
+  "tool": "analyze_mesh",
+  "stl_path": "/tmp/minha_peca.stl",
+  "overhang_deg": 45,
+  "bed_tol": 0.3
+}
+```
+Ou direto a partir de código SCAD (exporta STL internamente antes de analisar):
+```json
+{
+  "tool": "analyze_mesh",
+  "scad_code": "cube([30,30,10]);",
+  "timeout_s": 120
+}
+```
+
+### Timeout configurável de render
+`export_stl`, `export_3mf`, `export_dxf`, `export_svg` e `render_to_png` aceitam `timeout_s`
+(padrão 60s, limitado a [5, 900]s) para peças complexas que demoram mais para renderizar:
+```json
+{
+  "tool": "export_stl",
+  "scad_code": "...",
+  "output_path": "/tmp/peca_complexa.stl",
+  "timeout_s": 300
+}
+```
+
 ## Desenvolvimento
 
 ```bash
@@ -196,7 +237,7 @@ python -m pytest tests/ -v
 python -m pytest tests/ --cov=server --cov-report=term-missing
 ```
 
-Cobertura atual: **93%** — 197 testes.
+Cobertura atual: **95%** — 274 testes.
 
 ## Roadmap
 
