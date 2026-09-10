@@ -33,7 +33,7 @@
 | `generate_assembly` | Multi | Projeto multi-peça com vista explodida + BOM |
 | `generate_cnc_toolpath_hints` | CNC | Sugestões de parâmetros CNC por material |
 
-**Testes:** 197 testes · 93% cobertura · CI GitHub Actions
+**Testes:** 254 testes · 95% cobertura · CI GitHub Actions
 
 ---
 

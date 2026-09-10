@@ -28,10 +28,18 @@ def verify_safety_guidelines(scad_code: str, project_name: str = ""):
     for b in BANNED_KEYWORDS:
         if b in text:
             raise ValueError(f"Safety violation: Prohibited keyword '{b}' detected.")
+    # Block OpenSCAD file-reading functions in custom code
+    import re as _re
+    if _re.search(r'(?<![_a-zA-Z0-9])import\s*\(|(?<![_a-zA-Z0-9])surface\s*\(', scad_code, _re.IGNORECASE):
+        raise ValueError("Safety violation: OpenSCAD file-reading functions (import, surface) are prohibited.")
 
 def validate_output_path(path: str) -> str:
     resolved = os.path.abspath(path)
-    allowed_prefixes = ["/home/thas", "/tmp", "/var/tmp"]
+    env_paths = os.environ.get("MCP_OPENSCAD_ALLOWED_PATHS", "")
+    if env_paths:
+        allowed_prefixes = [p.strip() for p in env_paths.split(":") if p.strip()]
+    else:
+        allowed_prefixes = [os.path.expanduser("~"), "/tmp", "/var/tmp"]
     if not any(resolved.startswith(p) for p in allowed_prefixes):
         raise ValueError(f"Access denied: Path '{resolved}' is outside allowed directories.")
     return resolved
@@ -59,6 +67,8 @@ def validate_config_parameters(tool_name: str, config: dict) -> None:
             num = float(val)
         except (ValueError, TypeError):
             raise ValueError(f"Parameter '{name}' must be numeric.")
+        if not math.isfinite(num):
+            raise ValueError(f"Parameter '{name}' must be a finite number (got {val}).")
         if num <= 0:
             raise ValueError(f"Parameter '{name}' must be strictly positive.")
         return num
@@ -70,6 +80,8 @@ def validate_config_parameters(tool_name: str, config: dict) -> None:
             num = float(val)
         except (ValueError, TypeError):
             raise ValueError(f"Parameter '{name}' must be numeric.")
+        if not math.isfinite(num):
+            raise ValueError(f"Parameter '{name}' must be a finite number (got {val}).")
         if num < 0:
             raise ValueError(f"Parameter '{name}' must be non-negative.")
         return num
@@ -358,7 +370,7 @@ class TempFilePath(str):
 # ──────────────────────────────────────────────
 # Utilitário interno: roda openscad
 # ──────────────────────────────────────────────
-def run_openscad(scad_code: str, output_ext: str, export_args=None):
+async def run_openscad(scad_code: str, output_ext: str, export_args: list[str] | None = None) -> tuple:
     verify_safety_guidelines(scad_code)
     if export_args is None:
         export_args = []
@@ -367,28 +379,40 @@ def run_openscad(scad_code: str, output_ext: str, export_args=None):
         f.write(scad_code)
         scad_path = f.name
 
-    out_path = scad_path.replace(".scad", f".{output_ext}")
+    out_path = os.path.splitext(scad_path)[0] + f".{output_ext}"
 
     cmd = ["openscad", "-o", out_path] + export_args + [scad_path]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0 and not os.path.exists(out_path):
-            raise RuntimeError(f"OpenSCAD Error:\n{result.stderr}")
-        return TempFilePath(out_path), result.stdout + result.stderr
-    except subprocess.TimeoutExpired:
-        if os.path.exists(out_path):
-            try:
-                os.remove(out_path)
-            except Exception:
-                pass
-        raise RuntimeError("OpenSCAD Error: Execution timed out after 60 seconds.")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            if os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    pass
+            raise RuntimeError("OpenSCAD Error: Execution timed out after 60 seconds.")
+        stdout = stdout_b.decode("utf-8", errors="replace")
+        stderr = stderr_b.decode("utf-8", errors="replace")
+        if proc.returncode != 0 and not os.path.exists(out_path):
+            raise RuntimeError(f"OpenSCAD Error:\n{stderr}")
+        return TempFilePath(out_path), stdout + stderr
+    except RuntimeError:
+        raise
     except Exception as e:
         if os.path.exists(out_path):
             try:
                 os.remove(out_path)
             except Exception:
                 pass
-        raise e
+        raise
     finally:
         if os.path.exists(scad_path):
             try:
@@ -400,7 +424,7 @@ def run_openscad(scad_code: str, output_ext: str, export_args=None):
 # ──────────────────────────────────────────────
 # check_syntax: valida sintaxe sem renderizar
 # ──────────────────────────────────────────────
-def check_scad_syntax(scad_code: str) -> tuple:
+async def check_scad_syntax(scad_code: str) -> tuple:
     """
     Verifica sintaxe do código SCAD usando openscad.
     Retorna (is_valid, message).
@@ -411,11 +435,18 @@ def check_scad_syntax(scad_code: str) -> tuple:
         scad_path = f.name
 
     try:
-        result = subprocess.run(
-            ["openscad", "--export-format", "svg", "-o", os.devnull, scad_path],
-            capture_output=True, text=True, timeout=15
+        proc = await asyncio.create_subprocess_exec(
+            "openscad", "--export-format", "svg", "-o", os.devnull, scad_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        stderr = result.stderr.strip()
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return False, "❌ Timeout ao verificar sintaxe."
+        stderr = stderr_b.decode("utf-8", errors="replace").strip()
         errors = [ln for ln in stderr.splitlines() if "ERROR" in ln or "error" in ln.lower()]
         if errors:
             return False, "Erros encontrados:\n" + "\n".join(errors)
@@ -423,8 +454,6 @@ def check_scad_syntax(scad_code: str) -> tuple:
         if warnings:
             return True, "✅ Sintaxe válida (com avisos):\n" + "\n".join(warnings)
         return True, "✅ Sintaxe válida — nenhum problema encontrado."
-    except subprocess.TimeoutExpired:
-        return False, "❌ Timeout ao verificar sintaxe."
     finally:
         if os.path.exists(scad_path):
             try:
@@ -447,7 +476,7 @@ def generate_laser_scad(config: dict) -> str:
     openings = config.get("openings", [])
 
     # Clamp kerf to material thickness
-    kerf = min(kerf, t - 0.1)
+    kerf = max(0.0, min(kerf, t - 0.1))
     slot = t - kerf
     gap  = 15
 
@@ -684,7 +713,7 @@ def generate_box_scad(config: dict) -> str:
     div_y = max(0, config.get("dividers_y", 0))
 
     # Clamp kerf to material thickness
-    kerf = min(kerf, t - 0.1)
+    kerf = max(0.0, min(kerf, t - 0.1))
     slot = t - kerf
     gap  = 15
 
@@ -2214,7 +2243,15 @@ def generate_assembly_scad(config: dict) -> tuple:
             "name": name,
         })
 
-        vol_mm3 = w * d * h
+        if ptype == "cylinder":
+            # Volume do cilindro: π × r² × h  (r = w/2 = diâmetro/2)
+            vol_mm3 = math.pi * (w / 2) ** 2 * h
+        elif ptype == "custom":
+            # Volume desconhecido para SCAD customizado — estimativa como caixa
+            vol_mm3 = w * d * h
+        else:
+            # Volume da caixa: w × d × h
+            vol_mm3 = w * d * h
         bom_rows.append({
             "name": name, "type": ptype,
             "dimensions": f"{w}×{d}×{h}mm",
@@ -2929,6 +2966,71 @@ async def handle_list_tools() -> list:
     ]
 
 
+
+# ──────────────────────────────────────────────
+# Helper: gera SCAD, salva, exporta formatos e retorna resultado com preview PNG
+# ──────────────────────────────────────────────
+async def _generate_and_export(
+    scad_code: str,
+    output_dir: str,
+    project_name: str,
+    results: list[str],
+    export_formats: list[tuple[str, str]] | None = None,
+    png_args: list[str] | None = None,
+    scad_2d: str | None = None,
+) -> list:
+    """
+    Helper que encapsula o padrão repetido em todos os handlers:
+    1. Salva o SCAD no disco
+    2. Exporta os formatos vetoriais (SVG, DXF, STL…)
+    3. Renderiza preview PNG
+    4. Retorna lista de TextContent + ImageContent
+
+    Args:
+        scad_code: código SCAD principal (3D)
+        output_dir: diretório de saída (já validado)
+        project_name: nome base dos arquivos (já sanitizado)
+        results: lista de mensagens de resultado acumuladas
+        export_formats: lista de (ext, label) a exportar; default = [("svg","🖼 SVG"),("dxf","📐 DXF")]
+        png_args: args extras para o render PNG; default = ["--autocenter","--viewall"]
+        scad_2d: código SCAD 2D alternativo para exports vetoriais; usa scad_code se None
+    """
+    if export_formats is None:
+        export_formats = [("svg", "🖼 SVG"), ("dxf", "📐 DXF")]
+    if png_args is None:
+        png_args = ["--autocenter", "--viewall"]
+    scad_src = scad_2d if scad_2d is not None else scad_code
+
+    # Salva SCAD
+    os.makedirs(output_dir, exist_ok=True)
+    scad_path = os.path.join(output_dir, f"{project_name}.scad")
+    with open(scad_path, "w") as f:
+        f.write(scad_code)
+
+    # Exports vetoriais
+    for fmt, label in export_formats:
+        try:
+            dst = os.path.join(output_dir, f"{project_name}.{fmt}")
+            p, _ = await run_openscad(scad_src, fmt)
+            shutil.move(p, dst)
+            results.append(f"{label} gerado: {dst}")
+        except Exception as e:
+            results.append(f"❌ Erro {fmt.upper()}: {e}")
+
+    # Preview PNG
+    try:
+        out_path, _ = await run_openscad(scad_code, "png", png_args)
+        with open(out_path, "rb") as f:
+            img_data = base64.b64encode(f.read()).decode("utf-8")
+        os.remove(out_path)
+        return [
+            types.TextContent(type="text", text="\n".join(results)),
+            types.ImageContent(type="image", data=img_data, mimeType="image/png"),
+        ]
+    except Exception as e:
+        results.append(f"❌ Erro PNG: {e}")
+        return [types.TextContent(type="text", text="\n".join(results))]
+
 @server.call_tool()
 async def handle_call_tool(
     name: str, arguments: dict | None
@@ -2983,7 +3085,8 @@ async def handle_call_tool(
         extra_args = []
         for k, v in variables.items():
             if isinstance(v, str):
-                extra_args.extend(["-D", f'{k}="{v}"'])
+                escaped_v = str(v).replace('"', '\\"')
+                extra_args.extend(["-D", f'{k}="{escaped_v}"'])
             elif isinstance(v, bool):
                 extra_args.extend(["-D", f'{k}={"true" if v else "false"}'])
             else:
@@ -3017,7 +3120,7 @@ async def handle_call_tool(
 
             out_path = None
             try:
-                out_path, _ = run_openscad(scad_code, "png", render_args)
+                out_path, _ = await run_openscad(scad_code, "png", render_args)
                 with open(out_path, "rb") as f:
                     img_data = base64.b64encode(f.read()).decode("utf-8")
                 return [
@@ -3039,7 +3142,7 @@ async def handle_call_tool(
             ext = name.split("_")[1]
             out_path = None
             try:
-                out_path, _ = run_openscad(scad_code, ext, extra_args)
+                out_path, _ = await run_openscad(scad_code, ext, extra_args)
                 shutil.move(out_path, output_path)
                 return [types.TextContent(type="text", text=f"Exported successfully to {output_path}")]
             except Exception as e:
@@ -3054,7 +3157,7 @@ async def handle_call_tool(
     elif name == "check_syntax":
         if not arguments or "scad_code" not in arguments:
             raise ValueError("Missing 'scad_code' argument")
-        is_valid, msg = check_scad_syntax(arguments["scad_code"])
+        is_valid, msg = await check_scad_syntax(arguments["scad_code"])
         return [types.TextContent(type="text", text=msg)]
 
     elif name == "validate_laser_config":
@@ -3070,39 +3173,13 @@ async def handle_call_tool(
         config       = arguments.get("config", {})
         output_dir   = arguments.get("output_dir", "/tmp")
         project_name = arguments.get("project_name", "laser_part")
-        os.makedirs(output_dir, exist_ok=True)
-
         warns     = validate_config(config)
         scad_code = generate_laser_scad(config)
-        scad_path = os.path.join(output_dir, f"{project_name}.scad")
-        with open(scad_path, "w") as f:
-            f.write(scad_code)
-
-        results = [f"📄 SCAD gerado: {scad_path}"]
+        scad_2d   = scad_code.replace('RENDER_MODE = "3d"', 'RENDER_MODE = "2d"')
+        results   = [f"📄 SCAD gerado: {os.path.join(output_dir, project_name + '.scad')}"]
         if warns:
             results.append("⚠ Avisos:\n" + "\n".join(warns))
-
-        scad_2d = scad_code.replace('RENDER_MODE = "3d"', 'RENDER_MODE = "2d"')
-
-        for fmt, label in [("svg", "🖼 SVG"), ("dxf", "📐 DXF")]:
-            try:
-                dst = os.path.join(output_dir, f"{project_name}.{fmt}")
-                p, _ = run_openscad(scad_2d, fmt)
-                shutil.move(p, dst)
-                results.append(f"{label} gerado: {dst}")
-            except Exception as e:
-                results.append(f"❌ Erro {fmt.upper()}: {e}")
-
-        try:
-            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
-            with open(out_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(out_path)
-            return [types.TextContent(type="text", text="\n".join(results)),
-                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
-        except Exception as e:
-            results.append(f"❌ Erro PNG: {e}")
-            return [types.TextContent(type="text", text="\n".join(results))]
+        return await _generate_and_export(scad_code, output_dir, project_name, results, scad_2d=scad_2d)
 
     elif name == "generate_box":
         if not arguments:
@@ -3110,47 +3187,20 @@ async def handle_call_tool(
         config       = arguments.get("config", {})
         output_dir   = arguments.get("output_dir", "/tmp")
         project_name = arguments.get("project_name", "box")
-        os.makedirs(output_dir, exist_ok=True)
-
         warns     = validate_box_config(config)
         scad_code = generate_box_scad(config)
-        scad_path = os.path.join(output_dir, f"{project_name}.scad")
-        with open(scad_path, "w") as f:
-            f.write(scad_code)
-
-        results = [f"📦 Caixa gerada: {scad_path}"]
+        sw, sh    = arguments.get("sheet_width", 600), arguments.get("sheet_height", 400)
+        est       = estimate_material_use(config, sw, sh)
+        scad_2d   = scad_code.replace('RENDER_MODE = "3d"', 'RENDER_MODE = "2d"')
+        results   = [f"📦 Caixa gerada: {os.path.join(output_dir, project_name + '.scad')}"]
         if warns:
             results.append("⚠ Avisos:\n" + "\n".join(warns))
-
-        sw  = arguments.get("sheet_width", 600)
-        sh  = arguments.get("sheet_height", 400)
-        est = estimate_material_use(config, sw, sh)
         results.append(
             f"\n📊 Material ({sw}x{sh}mm):\n"
             + "\n".join(f"  {p['name']} x{p['qty']}: {p['w']:.0f}×{p['h']:.0f}mm" for p in est["pieces"])
             + f"\n  Área: {est['total_area_cm2']} cm² | Uso: {est['usage_percent']}% | Chapas: {est['sheets_needed']}"
         )
-
-        scad_2d = scad_code.replace('RENDER_MODE = "3d"', 'RENDER_MODE = "2d"')
-        for fmt, label in [("svg", "🖼 SVG"), ("dxf", "📐 DXF")]:
-            try:
-                dst = os.path.join(output_dir, f"{project_name}.{fmt}")
-                p, _ = run_openscad(scad_2d, fmt)
-                shutil.move(p, dst)
-                results.append(f"{label} gerado: {dst}")
-            except Exception as e:
-                results.append(f"❌ Erro {fmt.upper()}: {e}")
-
-        try:
-            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
-            with open(out_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(out_path)
-            return [types.TextContent(type="text", text="\n".join(results)),
-                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
-        except Exception as e:
-            results.append(f"❌ Erro PNG: {e}")
-            return [types.TextContent(type="text", text="\n".join(results))]
+        return await _generate_and_export(scad_code, output_dir, project_name, results, scad_2d=scad_2d)
 
     elif name == "generate_kerf_test":
         if not arguments:
@@ -3158,34 +3208,10 @@ async def handle_call_tool(
         config       = arguments.get("config", {})
         output_dir   = arguments.get("output_dir", "/tmp")
         project_name = arguments.get("project_name", "kerf_test")
-        os.makedirs(output_dir, exist_ok=True)
-
         scad_code = generate_kerf_test_scad(config)
-        scad_path = os.path.join(output_dir, f"{project_name}.scad")
-        with open(scad_path, "w") as f:
-            f.write(scad_code)
-
-        results = [f"🔬 Placa de kerf gerada: {scad_path}"]
-        for fmt, label in [("svg", "🖼 SVG"), ("dxf", "📐 DXF")]:
-            try:
-                dst = os.path.join(output_dir, f"{project_name}.{fmt}")
-                p, _ = run_openscad(scad_code, fmt)
-                shutil.move(p, dst)
-                results.append(f"{label} gerado: {dst}")
-            except Exception as e:
-                results.append(f"❌ Erro {fmt.upper()}: {e}")
-
-        try:
-            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall", "--projection=ortho"])
-            with open(out_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(out_path)
-            results.append("📷 Preview gerado.")
-            return [types.TextContent(type="text", text="\n".join(results)),
-                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
-        except Exception as e:
-            results.append(f"❌ Erro PNG: {e}")
-            return [types.TextContent(type="text", text="\n".join(results))]
+        results   = [f"🔬 Placa de kerf gerada: {os.path.join(output_dir, project_name + '.scad')}"]
+        return await _generate_and_export(scad_code, output_dir, project_name, results,
+                                          png_args=["--autocenter", "--viewall", "--projection=ortho"])
 
     elif name == "generate_finger_test":
         if not arguments:
@@ -3193,34 +3219,10 @@ async def handle_call_tool(
         config       = arguments.get("config", {})
         output_dir   = arguments.get("output_dir", "/tmp")
         project_name = arguments.get("project_name", "finger_test")
-        os.makedirs(output_dir, exist_ok=True)
-
         scad_code = generate_finger_test_scad(config)
-        scad_path = os.path.join(output_dir, f"{project_name}.scad")
-        with open(scad_path, "w") as f:
-            f.write(scad_code)
-
-        results = [f"🔧 Pente de finger joints gerado: {scad_path}"]
-        for fmt, label in [("svg", "🖼 SVG"), ("dxf", "📐 DXF")]:
-            try:
-                dst = os.path.join(output_dir, f"{project_name}.{fmt}")
-                p, _ = run_openscad(scad_code, fmt)
-                shutil.move(p, dst)
-                results.append(f"{label} gerado: {dst}")
-            except Exception as e:
-                results.append(f"❌ Erro {fmt.upper()}: {e}")
-
-        try:
-            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall", "--projection=ortho"])
-            with open(out_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(out_path)
-            results.append("📷 Preview gerado.")
-            return [types.TextContent(type="text", text="\n".join(results)),
-                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
-        except Exception as e:
-            results.append(f"❌ Erro PNG: {e}")
-            return [types.TextContent(type="text", text="\n".join(results))]
+        results   = [f"🔧 Pente de finger joints gerado: {os.path.join(output_dir, project_name + '.scad')}"]
+        return await _generate_and_export(scad_code, output_dir, project_name, results,
+                                          png_args=["--autocenter", "--viewall", "--projection=ortho"])
 
     elif name == "estimate_material_use":
         if not arguments or "config" not in arguments:
@@ -3250,32 +3252,10 @@ async def handle_call_tool(
         config       = arguments.get("config", {})
         output_dir   = arguments.get("output_dir", "/tmp")
         project_name = arguments.get("project_name", "box_3d")
-        os.makedirs(output_dir, exist_ok=True)
-
         scad_code = generate_3d_box_scad(config)
-        scad_path = os.path.join(output_dir, f"{project_name}.scad")
-        with open(scad_path, "w") as f:
-            f.write(scad_code)
-
-        results = [f"📦 Caixa 3D gerada: {scad_path}"]
-        try:
-            stl_path = os.path.join(output_dir, f"{project_name}.stl")
-            p, _ = run_openscad(scad_code, "stl")
-            shutil.move(p, stl_path)
-            results.append(f"📐 STL gerado: {stl_path}")
-        except Exception as e:
-            results.append(f"❌ Erro STL: {e}")
-
-        try:
-            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
-            with open(out_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(out_path)
-            return [types.TextContent(type="text", text="\n".join(results)),
-                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
-        except Exception as e:
-            results.append(f"❌ Erro PNG: {e}")
-            return [types.TextContent(type="text", text="\n".join(results))]
+        results   = [f"📦 Caixa 3D gerada: {os.path.join(output_dir, project_name + '.scad')}"]
+        return await _generate_and_export(scad_code, output_dir, project_name, results,
+                                          export_formats=[("stl", "📐 STL")])
 
     elif name == "generate_bracket":
         if not arguments:
@@ -3283,32 +3263,10 @@ async def handle_call_tool(
         config       = arguments.get("config", {})
         output_dir   = arguments.get("output_dir", "/tmp")
         project_name = arguments.get("project_name", "bracket")
-        os.makedirs(output_dir, exist_ok=True)
-
         scad_code = generate_bracket_scad(config)
-        scad_path = os.path.join(output_dir, f"{project_name}.scad")
-        with open(scad_path, "w") as f:
-            f.write(scad_code)
-
-        results = [f"🔩 Suporte gerado: {scad_path}"]
-        try:
-            stl_path = os.path.join(output_dir, f"{project_name}.stl")
-            p, _ = run_openscad(scad_code, "stl")
-            shutil.move(p, stl_path)
-            results.append(f"📐 STL gerado: {stl_path}")
-        except Exception as e:
-            results.append(f"❌ Erro STL: {e}")
-
-        try:
-            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
-            with open(out_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(out_path)
-            return [types.TextContent(type="text", text="\n".join(results)),
-                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
-        except Exception as e:
-            results.append(f"❌ Erro PNG: {e}")
-            return [types.TextContent(type="text", text="\n".join(results))]
+        results   = [f"🔩 Suporte gerado: {os.path.join(output_dir, project_name + '.scad')}"]
+        return await _generate_and_export(scad_code, output_dir, project_name, results,
+                                          export_formats=[("stl", "📐 STL")])
 
     elif name == "generate_enclosure":
         if not arguments:
@@ -3316,35 +3274,13 @@ async def handle_call_tool(
         config       = arguments.get("config", {})
         output_dir   = arguments.get("output_dir", "/tmp")
         project_name = arguments.get("project_name", "enclosure")
-        os.makedirs(output_dir, exist_ok=True)
-
         scad_code = generate_enclosure_scad(config)
-        scad_path = os.path.join(output_dir, f"{project_name}.scad")
-        with open(scad_path, "w") as f:
-            f.write(scad_code)
-
-        results = [
-            f"🖥 Gabinete gerado: {scad_path}",
+        results   = [
+            f"🖥 Gabinete gerado: {os.path.join(output_dir, project_name + '.scad')}",
             f"  Conectores: {len(config.get('connectors', []))} | Standoffs: {len(config.get('pcb_standoffs', []))}",
         ]
-        try:
-            stl_path = os.path.join(output_dir, f"{project_name}.stl")
-            p, _ = run_openscad(scad_code, "stl")
-            shutil.move(p, stl_path)
-            results.append(f"📐 STL gerado: {stl_path}")
-        except Exception as e:
-            results.append(f"❌ Erro STL: {e}")
-
-        try:
-            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
-            with open(out_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(out_path)
-            return [types.TextContent(type="text", text="\n".join(results)),
-                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
-        except Exception as e:
-            results.append(f"❌ Erro PNG: {e}")
-            return [types.TextContent(type="text", text="\n".join(results))]
+        return await _generate_and_export(scad_code, output_dir, project_name, results,
+                                          export_formats=[("stl", "📐 STL")])
 
     elif name == "generate_living_hinge":
         if not arguments:
@@ -3352,34 +3288,10 @@ async def handle_call_tool(
         config       = arguments.get("config", {})
         output_dir   = arguments.get("output_dir", "/tmp")
         project_name = arguments.get("project_name", "living_hinge")
-        os.makedirs(output_dir, exist_ok=True)
-
         scad_code = generate_living_hinge_scad(config)
-        scad_path = os.path.join(output_dir, f"{project_name}.scad")
-        with open(scad_path, "w") as f:
-            f.write(scad_code)
-
-        results = [f"🔗 Living hinge gerado: {scad_path}"]
-        for fmt, label in [("svg", "🖼 SVG"), ("dxf", "📐 DXF")]:
-            try:
-                dst = os.path.join(output_dir, f"{project_name}.{fmt}")
-                p, _ = run_openscad(scad_code, fmt)
-                shutil.move(p, dst)
-                results.append(f"{label} gerado: {dst}")
-            except Exception as e:
-                results.append(f"❌ Erro {fmt.upper()}: {e}")
-
-        try:
-            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall", "--projection=ortho"])
-            with open(out_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(out_path)
-            results.append("📷 Preview gerado.")
-            return [types.TextContent(type="text", text="\n".join(results)),
-                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
-        except Exception as e:
-            results.append(f"❌ Erro PNG: {e}")
-            return [types.TextContent(type="text", text="\n".join(results))]
+        results   = [f"🔗 Living hinge gerado: {os.path.join(output_dir, project_name + '.scad')}"]
+        return await _generate_and_export(scad_code, output_dir, project_name, results,
+                                          png_args=["--autocenter", "--viewall", "--projection=ortho"])
 
     elif name == "generate_dogbone":
         if not arguments:
@@ -3387,34 +3299,10 @@ async def handle_call_tool(
         config       = arguments.get("config", {})
         output_dir   = arguments.get("output_dir", "/tmp")
         project_name = arguments.get("project_name", "dogbone")
-        os.makedirs(output_dir, exist_ok=True)
-
         scad_code = generate_dogbone_scad(config)
-        scad_path = os.path.join(output_dir, f"{project_name}.scad")
-        with open(scad_path, "w") as f:
-            f.write(scad_code)
-
-        results = [f"🦴 Dogbone pocket gerado: {scad_path}"]
-        for fmt, label in [("svg", "🖼 SVG"), ("dxf", "📐 DXF")]:
-            try:
-                dst = os.path.join(output_dir, f"{project_name}.{fmt}")
-                p, _ = run_openscad(scad_code, fmt)
-                shutil.move(p, dst)
-                results.append(f"{label} gerado: {dst}")
-            except Exception as e:
-                results.append(f"❌ Erro {fmt.upper()}: {e}")
-
-        try:
-            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall", "--projection=ortho"])
-            with open(out_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(out_path)
-            results.append("📷 Preview gerado.")
-            return [types.TextContent(type="text", text="\n".join(results)),
-                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
-        except Exception as e:
-            results.append(f"❌ Erro PNG: {e}")
-            return [types.TextContent(type="text", text="\n".join(results))]
+        results   = [f"🦴 Dogbone pocket gerado: {os.path.join(output_dir, project_name + '.scad')}"]
+        return await _generate_and_export(scad_code, output_dir, project_name, results,
+                                          png_args=["--autocenter", "--viewall", "--projection=ortho"])
 
     elif name == "validate_printability":
         if not arguments or "config" not in arguments:
@@ -3444,32 +3332,10 @@ async def handle_call_tool(
         config       = arguments.get("config", {})
         output_dir   = arguments.get("output_dir", "/tmp")
         project_name = arguments.get("project_name", "tolerance_test")
-        os.makedirs(output_dir, exist_ok=True)
-
         scad_code = generate_tolerance_test_scad(config)
-        scad_path = os.path.join(output_dir, f"{project_name}.scad")
-        with open(scad_path, "w") as f:
-            f.write(scad_code)
-
-        results = [f"🔬 Placa de tolerância gerada: {scad_path}"]
-        try:
-            stl_path = os.path.join(output_dir, f"{project_name}.stl")
-            p, _ = run_openscad(scad_code, "stl")
-            shutil.move(p, stl_path)
-            results.append(f"📐 STL gerado: {stl_path}")
-        except Exception as e:
-            results.append(f"❌ Erro STL: {e}")
-
-        try:
-            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
-            with open(out_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(out_path)
-            return [types.TextContent(type="text", text="\n".join(results)),
-                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
-        except Exception as e:
-            results.append(f"❌ Erro PNG: {e}")
-            return [types.TextContent(type="text", text="\n".join(results))]
+        results   = [f"🔬 Placa de tolerância gerada: {os.path.join(output_dir, project_name + '.scad')}"]
+        return await _generate_and_export(scad_code, output_dir, project_name, results,
+                                          export_formats=[("stl", "📐 STL")])
 
     elif name == "generate_bed_level_test":
         if not arguments:
@@ -3477,32 +3343,10 @@ async def handle_call_tool(
         config       = arguments.get("config", {})
         output_dir   = arguments.get("output_dir", "/tmp")
         project_name = arguments.get("project_name", "bed_level_test")
-        os.makedirs(output_dir, exist_ok=True)
-
         scad_code = generate_bed_level_test_scad(config)
-        scad_path = os.path.join(output_dir, f"{project_name}.scad")
-        with open(scad_path, "w") as f:
-            f.write(scad_code)
-
-        results = [f"📏 Teste de nivelamento gerado: {scad_path}"]
-        try:
-            stl_path = os.path.join(output_dir, f"{project_name}.stl")
-            p, _ = run_openscad(scad_code, "stl")
-            shutil.move(p, stl_path)
-            results.append(f"📐 STL gerado: {stl_path}")
-        except Exception as e:
-            results.append(f"❌ Erro STL: {e}")
-
-        try:
-            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
-            with open(out_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(out_path)
-            return [types.TextContent(type="text", text="\n".join(results)),
-                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
-        except Exception as e:
-            results.append(f"❌ Erro PNG: {e}")
-            return [types.TextContent(type="text", text="\n".join(results))]
+        results   = [f"📏 Teste de nivelamento gerado: {os.path.join(output_dir, project_name + '.scad')}"]
+        return await _generate_and_export(scad_code, output_dir, project_name, results,
+                                          export_formats=[("stl", "📐 STL")])
 
     elif name == "generate_retraction_test":
         if not arguments:
@@ -3510,32 +3354,10 @@ async def handle_call_tool(
         config       = arguments.get("config", {})
         output_dir   = arguments.get("output_dir", "/tmp")
         project_name = arguments.get("project_name", "retraction_test")
-        os.makedirs(output_dir, exist_ok=True)
-
         scad_code = generate_retraction_test_scad(config)
-        scad_path = os.path.join(output_dir, f"{project_name}.scad")
-        with open(scad_path, "w") as f:
-            f.write(scad_code)
-
-        results = [f"🗼 Torre de retração gerada: {scad_path}"]
-        try:
-            stl_path = os.path.join(output_dir, f"{project_name}.stl")
-            p, _ = run_openscad(scad_code, "stl")
-            shutil.move(p, stl_path)
-            results.append(f"📐 STL gerado: {stl_path}")
-        except Exception as e:
-            results.append(f"❌ Erro STL: {e}")
-
-        try:
-            out_path, _ = run_openscad(scad_code, "png", ["--autocenter", "--viewall"])
-            with open(out_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(out_path)
-            return [types.TextContent(type="text", text="\n".join(results)),
-                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
-        except Exception as e:
-            results.append(f"❌ Erro PNG: {e}")
-            return [types.TextContent(type="text", text="\n".join(results))]
+        results   = [f"🗼 Torre de retração gerada: {os.path.join(output_dir, project_name + '.scad')}"]
+        return await _generate_and_export(scad_code, output_dir, project_name, results,
+                                          export_formats=[("stl", "📐 STL")])
 
     elif name == "suggest_orientation":
         if not arguments or "config" not in arguments:
@@ -3583,27 +3405,8 @@ async def handle_call_tool(
             f.write(bom_md)
         results.append(f"📋 BOM: {bom_path}")
 
-        # Export STL
-        try:
-            stl_path = os.path.join(output_dir, f"{project_name}.stl")
-            p, _ = run_openscad(scad_assembly, "stl")
-            shutil.move(p, stl_path)
-            results.append(f"📐 STL assembly: {stl_path}")
-        except Exception as e:
-            results.append(f"❌ Erro STL: {e}")
-
-        # Preview PNG
-        try:
-            out_path, _ = run_openscad(scad_assembly, "png", ["--autocenter", "--viewall"])
-            with open(out_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(out_path)
-            results.append("📷 Preview gerado.")
-            return [types.TextContent(type="text", text="\n".join(results)),
-                    types.ImageContent(type="image", data=img_data, mimeType="image/png")]
-        except Exception as e:
-            results.append(f"❌ Erro PNG: {e}")
-            return [types.TextContent(type="text", text="\n".join(results))]
+        return await _generate_and_export(scad_assembly, output_dir, project_name, results,
+                                          export_formats=[("stl", "📐 STL assembly")])
 
     elif name == "generate_cnc_toolpath_hints":
         if not arguments or "config" not in arguments:
@@ -3652,7 +3455,7 @@ async def main():
             write_stream,
             InitializationOptions(
                 server_name="mcp-openscad",
-                server_version="0.4.0",
+                server_version="0.5.0",
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},

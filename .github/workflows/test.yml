@@ -10,13 +10,19 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+      fail-fast: false
+
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up Python
+    - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
       with:
-        python-version: "3.12"
+        python-version: ${{ matrix.python-version }}
+        cache: 'pip'
 
     - name: Install OpenSCAD
       run: |
@@ -29,14 +35,15 @@ jobs:
         pip install -r requirements.txt
         pip install -r requirements-dev.txt
 
+    - name: Lint with ruff
+      run: |
+        pip install ruff
+        ruff check server.py --select=E,F,W --ignore=E501,E402
+      continue-on-error: true
+
     - name: Validate import
       run: python -c "import server; print('Import OK')"
 
     - name: Run tests with coverage
       run: |
-        pytest --cov=server --cov-report=term-missing --cov-fail-under=85 -v tests/
-
-    - name: Check coverage summary
-      run: |
-        echo "Coverage target: >= 85%"
-        pytest --cov=server --cov-report=xml tests/ -q
+        xvfb-run -a pytest --cov=server --cov-report=term-missing --cov-report=xml --cov-fail-under=85 -v tests/
