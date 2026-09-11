@@ -57,10 +57,12 @@ For each male/female (pin/hole, boss/bore, press-fit) pair:
    actually interface.
 2. Run `mesh_section` on both parts at those heights (same `axis`, matching
    z/z_list, ideally the same `center` so radii are directly comparable).
-3. Read the male part's OD from its outer contour (`2 * r_max`) and the
-   female part's bore diameter from its inner contour (`2 * r_max` of the
-   bore contour — see `mesh_section`'s own "Ø externo/Ø interno/parede" line
-   for a hollow section).
+3. Read the male part's OD from its outer contour and the female part's bore
+   diameter from its inner contour — both as `2 * r_max` (the nominal vertex
+   radius on a faceted/`$fn` mesh), never `r_min` (the facet apothem, which
+   is smaller and not what the design dimension refers to). This is exactly
+   `mesh_section`'s own "Ø externo/Ø interno/parede" line for a hollow
+   section.
 4. Compute `clearance_mm = (female_bore_diameter - male_od) / 2` (radial
    clearance per side).
 5. Compare against the design's intended clearance, tolerance **±0.05mm**.

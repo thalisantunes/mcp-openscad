@@ -3016,6 +3016,8 @@ def mesh_section(path: str, zs, axis: str = "z", center=None) -> dict:
 
     Contornos são ordenados por r_max decrescente — para um tubo oco,
     contours[0] é a parede externa e contours[1] é o furo (bore).
+    Diâmetros e espessura de parede usam r_max (raio nominal dos vértices);
+    r_min é o apótema do polígono $fn.
 
     Se o plano solicitado coincidir exatamente com um anel de vértices da
     malha (comum em meshes do OpenSCAD, ex. z=0), a altura é deslocada
@@ -3182,8 +3184,12 @@ def _format_mesh_section(r: dict) -> str:
             outer, inner = s["contours"][0], s["contours"][1]
             d_ext = 2 * outer["r_max"]
             d_int = 2 * inner["r_max"]
-            wall = outer["r_min"] - inner["r_max"]
+            wall = outer["r_max"] - inner["r_max"]
             lines.append(f"  Ø externo {d_ext:.3f} | Ø interno {d_int:.3f} | parede {wall:.3f}")
+            lines.append(
+                "  (diâmetros e parede usam r_max — raio nominal dos vértices; "
+                "r_min é o apótema do polígono $fn)"
+            )
     return "\n".join(lines)
 
 

@@ -2828,12 +2828,14 @@ async def test_mesh_section_hollow_cylinder_fn_polygon():
     Tubo oco Ø externo 40mm / Ø interno 37.6mm ($fn=24). Para um polígono de
     $fn lados aproximando um círculo de raio R, os vértices (arestas verticais
     do prisma) ficam exatamente em r_max=R em qualquer altura — por isso
-    Ø ext/int (2*r_max) é preciso em qualquer corte. Já o r_min (apótema)
-    só bate exatamente com R*cos(pi/$fn) na meia-altura: em alturas
-    intermediárias, o ponto de cruzamento com a diagonal de triangulação de
-    cada face lateral plana cai num ponto do "chord" mais próximo de um dos
-    vértices (mais perto de R), então usamos limites (>= apótema, <= R) nas
-    outras alturas e a igualdade exata só na meia-altura.
+    Ø ext/int e a parede (todos calculados a partir de r_max, não de r_min)
+    são precisos e height-independent em qualquer corte: parede = outer_r -
+    inner_r = 1.2mm exatamente. Já o r_min (apótema) só bate exatamente com
+    R*cos(pi/$fn) na meia-altura: em alturas intermediárias, o ponto de
+    cruzamento com a diagonal de triangulação de cada face lateral plana cai
+    num ponto do "chord" mais próximo de um dos vértices (mais perto de R),
+    então usamos limites (>= apótema, <= R) nas outras alturas e a igualdade
+    exata só na meia-altura.
     """
     fn = 24
     outer_r = 20.0
@@ -2873,13 +2875,17 @@ async def test_mesh_section_hollow_cylinder_fn_polygon():
             assert expected_apothem_outer - 1e-3 <= outer["r_min"] <= outer_r + 1e-3
             assert expected_apothem_inner - 1e-3 <= inner["r_min"] <= inner_r + 1e-3
 
+            # parede = outer.r_max - inner.r_max (mesma convenção de Ø ext/int,
+            # ambos raios nominais dos vértices) — height-independent.
+            wall = outer["r_max"] - inner["r_max"]
+            assert wall == pytest.approx(outer_r - inner_r, abs=1e-3)
+            assert wall == pytest.approx(1.2, abs=1e-3)
+
             if z == mid_z:
                 # Na meia-altura, o cruzamento com a diagonal cai exatamente
                 # no ponto médio da corda — o apótema exato.
                 assert outer["r_min"] == pytest.approx(expected_apothem_outer, abs=1e-2)
                 assert inner["r_min"] == pytest.approx(expected_apothem_inner, abs=1e-2)
-                wall = outer["r_min"] - inner["r_max"]
-                assert wall == pytest.approx(expected_apothem_outer - inner_r, abs=1e-2)
     finally:
         if os.path.exists(out_path):
             os.remove(out_path)
