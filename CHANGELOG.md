@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-09-10
+
+### Added
+- `mesh_section` — new tool (26 total): cross-section readback of an STL/SCAD part for
+  fit checks between mating parts (press-fits, bores, pins). Reuses `_parse_stl` and
+  the same `stl_path`/`scad_code` (+ `variables`, `timeout_s`) input contract as
+  `analyze_mesh` (now factored into a shared `_resolve_stl_input()` helper). Cuts by
+  one or more planes perpendicular to a configurable `axis` (`x`/`y`/`z`, default
+  `z`) at `z` or `z_list` (max 50 heights), via standard triangle-edge/plane
+  intersection (all degenerate cases — coplanar face, single-vertex touch, on-plane
+  edge — handled explicitly and skipped/collapsed correctly, not just "skip
+  degenerate").
+  - Reports, per height: `n_points`, in-plane `bbox`/`extent`, `r_min`/`r_max` from a
+    `center` (default: centroid of that height's points; can be pinned so multiple
+    heights/parts are compared against the same axis), and `contours` — closed loops
+    found by linking segments on shared endpoints rounded to 1e-6, sorted by `r_max`
+    descending (so for a hollow tube `contours[0]` is the outer wall and
+    `contours[1]` is the bore)
+  - Automatically nudges the plane by `+1e-4` when it lands exactly on a vertex ring
+    (the classic OpenSCAD `z=0` base-ring case) and reports that in the output
+    instead of producing a degenerate/empty cut
+  - Formatted output prints a `Ø externo | Ø interno | parede` line for hollow
+    round sections (outer/inner diameter from each contour's `r_max`, wall thickness
+    as the worst case `r_min(outer) - r_max(inner)`)
+  - Same triangle cap (2,000,000) and STL parsing as `analyze_mesh`
+  - Function signature: `mesh_section(path, zs, axis="z", center=None) -> dict`
+
+### Added — Skill
+- `skills/3d-print-gate/SKILL.md` — a pre-slicing quality gate procedure that drives
+  `analyze_mesh` + `mesh_section`: export each part in print orientation, run
+  `analyze_mesh` per part against pass criteria (watertight, 1 component, 0 floating,
+  overhang ≤5%, bridge span ≤30mm), fit-check every mating pair with `mesh_section`
+  against a ±0.05mm clearance tolerance, sanity-check orientation beyond the
+  heuristic `suggest_orientation` score, and a blind read-only review of the `.scad`
+  source — because a good-looking render doesn't prove a mesh is manifold or a wall
+  has thickness. Installed for local use via a symlink at
+  `~/.claude/skills/3d-print-gate`.
+
+### Changed
+- Extracted `_resolve_stl_input()`: the `stl_path`/`scad_code` input resolution shared
+  by `analyze_mesh` and `mesh_section` (previously inlined only in `analyze_mesh`).
+
+### Tests
+- **288 tests** (up from 274), 94% coverage
+- 14 new tests: cube cross-sections on all 3 axes, `z_list`, the vertex-ring nudge,
+  an out-of-bbox empty section, the triangle cap, invalid `axis`, a real
+  OpenSCAD-exported hollow cylinder ($fn-polygon, Ø40/Ø37.6 verified against the
+  known `r_max=R` / `r_min=R·cos(π/$fn)` geometry), and the `mesh_section` MCP handler
+
 ## [0.7.0] — 2026-09-10
 
 ### Added

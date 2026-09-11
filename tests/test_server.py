@@ -568,7 +568,8 @@ async def test_handle_list_tools():
     assert "generate_cnc_toolpath_hints" in tool_names
     # Análise
     assert "analyze_mesh" in tool_names
-    assert len(tools) == 25
+    assert "mesh_section" in tool_names
+    assert len(tools) == 26
 
     mesh_tool = next(t for t in tools if t.name == "analyze_mesh")
     props = mesh_tool.inputSchema["properties"]
@@ -578,6 +579,16 @@ async def test_handle_list_tools():
     assert "bed_tol" in props
     assert "layer_h" in props
     assert "timeout_s" in props
+
+    section_tool = next(t for t in tools if t.name == "mesh_section")
+    sprops = section_tool.inputSchema["properties"]
+    assert "stl_path" in sprops
+    assert "scad_code" in sprops
+    assert "z" in sprops
+    assert "z_list" in sprops
+    assert "axis" in sprops
+    assert "center" in sprops
+    assert "timeout_s" in sprops
 
     for export_tool in ("render_to_png", "export_stl", "export_3mf", "export_dxf", "export_svg"):
         t = next(t for t in tools if t.name == export_tool)
@@ -2710,5 +2721,221 @@ async def test_handle_call_tool_analyze_mesh_from_scad_code():
     ret = await server.handle_call_tool("analyze_mesh", {"scad_code": "cube([10,10,10]);"})
     assert len(ret) == 1
     assert "triângulos" in ret[0].text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mesh_section: geometria pura (malhas sintéticas)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_mesh_section_cube_axes(tmp_path):
+    """Cubo 10mm cortado no meio em cada eixo deve dar seção 10x10, 1 contorno."""
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube.stl"
+    _write_binary_stl(str(p), tris)
+
+    for axis in ("x", "y", "z"):
+        r = server.mesh_section(str(p), 5.0, axis=axis)
+        assert r["axis"] == axis
+        s = r["sections"][0]
+        assert s["n_points"] > 0
+        assert len(s["contours"]) == 1
+        assert s["extent"][0] == pytest.approx(10.0, abs=1e-6)
+        assert s["extent"][1] == pytest.approx(10.0, abs=1e-6)
+        assert s["nudged"] is False
+
+
+def test_mesh_section_z_list(tmp_path):
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube.stl"
+    _write_binary_stl(str(p), tris)
+
+    r = server.mesh_section(str(p), [2.0, 5.0, 8.0])
+    assert len(r["sections"]) == 3
+    for s in r["sections"]:
+        assert s["n_points"] > 0
+        assert len(s["contours"]) == 1
+
+
+def test_mesh_section_vertex_ring_nudge(tmp_path):
+    """Cortar exatamente em z=0 (anel de vértices da base) deve disparar o nudge automático."""
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube.stl"
+    _write_binary_stl(str(p), tris)
+
+    r = server.mesh_section(str(p), 0.0)
+    s = r["sections"][0]
+    assert s["nudged"] is True
+    assert s["z_used"] == pytest.approx(server._MESH_SECTION_NUDGE, abs=1e-9)
+    assert s["n_points"] > 0
+    assert len(s["contours"]) == 1
+
+
+def test_mesh_section_empty_outside_bbox(tmp_path):
+    """Plano fora do bounding box: n_points=0, sem crash."""
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube.stl"
+    _write_binary_stl(str(p), tris)
+
+    r = server.mesh_section(str(p), 50.0)
+    s = r["sections"][0]
+    assert s["n_points"] == 0
+    assert s["bbox"] is None
+    assert s["contours"] == []
+
+
+def test_mesh_section_triangle_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "STL_MAX_TRIANGLES", 5)
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "toobig.stl"
+    _write_binary_stl(str(p), tris)
+    with pytest.raises(ValueError, match="acima do limite"):
+        server.mesh_section(str(p), 5.0)
+
+
+def test_mesh_section_invalid_axis(tmp_path):
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube.stl"
+    _write_binary_stl(str(p), tris)
+    with pytest.raises(ValueError, match="axis"):
+        server.mesh_section(str(p), 5.0, axis="w")
+
+
+def test_mesh_section_z_list_too_long(tmp_path):
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube.stl"
+    _write_binary_stl(str(p), tris)
+    with pytest.raises(ValueError, match="50"):
+        server.mesh_section(str(p), [float(i) for i in range(51)])
+
+
+def test_format_mesh_section_returns_string(tmp_path):
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube.stl"
+    _write_binary_stl(str(p), tris)
+    r = server.mesh_section(str(p), 5.0)
+    text = server._format_mesh_section(r)
+    assert isinstance(text, str)
+    assert "Corte de Malha" in text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mesh_section: tubo oco via OpenSCAD real ($fn-polígono)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_mesh_section_hollow_cylinder_fn_polygon():
+    """
+    Tubo oco Ø externo 40mm / Ø interno 37.6mm ($fn=24). Para um polígono de
+    $fn lados aproximando um círculo de raio R, os vértices (arestas verticais
+    do prisma) ficam exatamente em r_max=R em qualquer altura — por isso
+    Ø ext/int e a parede (todos calculados a partir de r_max, não de r_min)
+    são precisos e height-independent em qualquer corte: parede = outer_r -
+    inner_r = 1.2mm exatamente. Já o r_min (apótema) só bate exatamente com
+    R*cos(pi/$fn) na meia-altura: em alturas intermediárias, o ponto de
+    cruzamento com a diagonal de triangulação de cada face lateral plana cai
+    num ponto do "chord" mais próximo de um dos vértices (mais perto de R),
+    então usamos limites (>= apótema, <= R) nas outras alturas e a igualdade
+    exata só na meia-altura.
+    """
+    fn = 24
+    outer_r = 20.0
+    inner_r = 18.8
+    height = 20.0
+    mid_z = height / 2
+    scad = f"""
+    $fn = {fn};
+    difference() {{
+        cylinder(h={height}, r={outer_r}, center=false);
+        translate([0, 0, -1]) cylinder(h={height + 2}, r={inner_r}, center=false);
+    }}
+    """
+    out_path, _ = await server.run_openscad(scad, "stl")
+    try:
+        expected_apothem_outer = outer_r * math.cos(math.pi / fn)
+        expected_apothem_inner = inner_r * math.cos(math.pi / fn)
+
+        for z in (5.0, mid_z, 15.0):
+            r = server.mesh_section(str(out_path), z)
+            s = r["sections"][0]
+            assert s["n_points"] > 0
+            assert len(s["contours"]) == 2
+
+            outer, inner = s["contours"]
+
+            # r_max (e portanto Ø ext/int) é o mesmo em qualquer altura —
+            # vem das arestas verticais do prisma, sempre no raio nominal.
+            assert outer["r_max"] == pytest.approx(outer_r, abs=1e-3)
+            assert inner["r_max"] == pytest.approx(inner_r, abs=1e-3)
+            d_ext = 2 * outer["r_max"]
+            d_int = 2 * inner["r_max"]
+            assert d_ext == pytest.approx(40.0, abs=1e-3)
+            assert d_int == pytest.approx(37.6, abs=1e-3)
+
+            # r_min está sempre entre o apótema ideal e R.
+            assert expected_apothem_outer - 1e-3 <= outer["r_min"] <= outer_r + 1e-3
+            assert expected_apothem_inner - 1e-3 <= inner["r_min"] <= inner_r + 1e-3
+
+            # parede = outer.r_max - inner.r_max (mesma convenção de Ø ext/int,
+            # ambos raios nominais dos vértices) — height-independent.
+            wall = outer["r_max"] - inner["r_max"]
+            assert wall == pytest.approx(outer_r - inner_r, abs=1e-3)
+            assert wall == pytest.approx(1.2, abs=1e-3)
+
+            if z == mid_z:
+                # Na meia-altura, o cruzamento com a diagonal cai exatamente
+                # no ponto médio da corda — o apótema exato.
+                assert outer["r_min"] == pytest.approx(expected_apothem_outer, abs=1e-2)
+                assert inner["r_min"] == pytest.approx(expected_apothem_inner, abs=1e-2)
+    finally:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mesh_section: handler MCP (handle_call_tool)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_mesh_section_stl_path(tmp_path):
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube.stl"
+    _write_binary_stl(str(p), tris)
+
+    ret = await server.handle_call_tool("mesh_section", {"stl_path": str(p), "z": 5.0})
+    assert len(ret) == 1
+    assert "Corte de Malha" in ret[0].text
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_mesh_section_missing_input():
+    with pytest.raises(ValueError, match="stl_path.*scad_code|scad_code.*stl_path"):
+        await server.handle_call_tool("mesh_section", {"z": 5.0})
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_mesh_section_missing_z(tmp_path):
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube.stl"
+    _write_binary_stl(str(p), tris)
+    with pytest.raises(ValueError, match="z"):
+        await server.handle_call_tool("mesh_section", {"stl_path": str(p)})
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_mesh_section_z_list(tmp_path):
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube.stl"
+    _write_binary_stl(str(p), tris)
+
+    ret = await server.handle_call_tool("mesh_section", {"stl_path": str(p), "z_list": [2.0, 5.0, 8.0]})
+    assert len(ret) == 1
+    assert ret[0].text.count("z_solicitado") == 3
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_mesh_section_from_scad_code():
+    ret = await server.handle_call_tool("mesh_section", {"scad_code": "cube([10,10,10]);", "z": 5.0})
+    assert len(ret) == 1
+    assert "Corte de Malha" in ret[0].text
 
 

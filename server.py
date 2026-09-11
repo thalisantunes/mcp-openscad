@@ -2954,6 +2954,246 @@ def _format_mesh_analysis(r: dict) -> str:
 
 
 # ──────────────────────────────────────────────
+# mesh_section: corte transversal (cross-section) de STL para fit-check
+# ──────────────────────────────────────────────
+
+_MESH_SECTION_AXES = {"x": 0, "y": 1, "z": 2}
+_MESH_SECTION_MAX_Z = 50
+_MESH_SECTION_NUDGE = 1e-4
+
+
+def _triangle_plane_segment(tri, axis_idx: int, plane_idx: tuple, z: float, eps: float = 1e-9):
+    """
+    Interseção de um triângulo com o plano perpendicular a axis_idx em z.
+    Retorna None (sem interseção/degenerado) ou um par de pontos 2D
+    (nas coordenadas de plane_idx) que formam o segmento de corte.
+    """
+    d = [v[axis_idx] - z for v in tri]
+    signs = [0 if abs(x) < eps else (1 if x > 0 else -1) for x in d]
+
+    def proj(v):
+        return (v[plane_idx[0]], v[plane_idx[1]])
+
+    def interp(a, b, da, db):
+        t = da / (da - db)
+        return tuple(a[k] + t * (b[k] - a[k]) for k in plane_idx)
+
+    pos = [i for i in range(3) if signs[i] > 0]
+    neg = [i for i in range(3) if signs[i] < 0]
+    zero = [i for i in range(3) if signs[i] == 0]
+
+    if len(zero) == 3:
+        return None  # triângulo coplanar ao corte — degenerado, ignorado
+    if len(zero) == 2:
+        if not pos and not neg:
+            return None
+        i, j = zero
+        return (proj(tri[i]), proj(tri[j]))
+    if len(zero) == 1:
+        if len(pos) == 2 or len(neg) == 2:
+            return None  # toque tangente num único vértice — sem segmento
+        i0 = zero[0]
+        others = [k for k in range(3) if k != i0]
+        a, b = tri[others[0]], tri[others[1]]
+        p = interp(a, b, d[others[0]], d[others[1]])
+        return (proj(tri[i0]), p)
+    if not pos or not neg:
+        return None  # todos do mesmo lado — sem interseção
+    lone_side, pair_side = (pos, neg) if len(pos) == 1 else (neg, pos)
+    lone = lone_side[0]
+    p1 = interp(tri[lone], tri[pair_side[0]], d[lone], d[pair_side[0]])
+    p2 = interp(tri[lone], tri[pair_side[1]], d[lone], d[pair_side[1]])
+    return (p1, p2)
+
+
+def mesh_section(path: str, zs, axis: str = "z", center=None) -> dict:
+    """
+    Corta um STL (binário ou ASCII) por um ou mais planos perpendiculares a
+    `axis` (default "z") e retorna, para cada altura solicitada: os pontos
+    de interseção, bounding box no plano, extensão (extent), r_min/r_max
+    (distância radial a partir de `center`) e os contornos (loops)
+    encontrados ligando segmentos por vértices compartilhados (1e-6).
+
+    Contornos são ordenados por r_max decrescente — para um tubo oco,
+    contours[0] é a parede externa e contours[1] é o furo (bore).
+    Diâmetros e espessura de parede usam r_max (raio nominal dos vértices);
+    r_min é o apótema do polígono $fn.
+
+    Se o plano solicitado coincidir exatamente com um anel de vértices da
+    malha (comum em meshes do OpenSCAD, ex. z=0), a altura é deslocada
+    automaticamente em +1e-4 e isso é reportado em `nudged`/`z_used`.
+
+    `zs` aceita um número único ou uma lista (máx. 50 valores).
+    `center`, se informado, é [c1, c2] nas coordenadas do plano (mesmo
+    center usado para todas as alturas); por padrão é o centroide dos
+    pontos de cada corte.
+    """
+    if axis not in _MESH_SECTION_AXES:
+        raise ValueError(f"axis inválido: {axis!r}. Use 'x', 'y' ou 'z'.")
+    axis_idx = _MESH_SECTION_AXES[axis]
+    plane_idx = tuple(i for i in range(3) if i != axis_idx)
+    plane_labels = tuple("xyz"[i] for i in plane_idx)
+
+    if not isinstance(zs, (list, tuple)):
+        zs = [zs]
+    zs = list(zs)
+    if len(zs) == 0:
+        raise ValueError("Forneça ao menos uma altura de corte (z ou z_list).")
+    if len(zs) > _MESH_SECTION_MAX_Z:
+        raise ValueError(f"z_list aceita no máximo {_MESH_SECTION_MAX_Z} valores.")
+
+    triangles = _parse_stl(path)
+    n_tri = len(triangles)
+    if n_tri > STL_MAX_TRIANGLES:
+        raise ValueError(f"STL tem {n_tri:,} triângulos — acima do limite de {STL_MAX_TRIANGLES:,}.")
+    if n_tri == 0:
+        raise ValueError("STL não contém triângulos.")
+
+    axis_coords = set()
+    for tri in triangles:
+        for v in tri:
+            axis_coords.add(round(v[axis_idx], 6))
+
+    sections = []
+    for z_req in zs:
+        z_req = float(z_req)
+        z_used = z_req
+        nudged = False
+        if round(z_used, 6) in axis_coords:
+            z_used = z_used + _MESH_SECTION_NUDGE
+            nudged = True
+
+        point_map = {}
+        point_coords = []
+        uf = _UnionFind()
+
+        def _get_pidx(pt):
+            key = (round(pt[0], 6), round(pt[1], 6))
+            idx = point_map.get(key)
+            if idx is None:
+                idx = uf.add()
+                point_map[key] = idx
+                point_coords.append(pt)
+            return idx
+
+        for tri in triangles:
+            seg = _triangle_plane_segment(tri, axis_idx, plane_idx, z_used)
+            if seg is None:
+                continue
+            p1, p2 = seg
+            i1 = _get_pidx(p1)
+            i2 = _get_pidx(p2)
+            if i1 != i2:
+                uf.union(i1, i2)
+
+        n_points = len(point_coords)
+        if n_points == 0:
+            sections.append({
+                "z_requested": z_req,
+                "z_used": z_used,
+                "nudged": nudged,
+                "n_points": 0,
+                "bbox": None,
+                "extent": None,
+                "center": None,
+                "r_min": None,
+                "r_max": None,
+                "contours": [],
+            })
+            continue
+
+        c1s = [p[0] for p in point_coords]
+        c2s = [p[1] for p in point_coords]
+        bbox_min = (min(c1s), min(c2s))
+        bbox_max = (max(c1s), max(c2s))
+        extent = (bbox_max[0] - bbox_min[0], bbox_max[1] - bbox_min[1])
+
+        if center is not None:
+            cx, cy = float(center[0]), float(center[1])
+        else:
+            cx = sum(c1s) / n_points
+            cy = sum(c2s) / n_points
+
+        def _radius(p):
+            return math.hypot(p[0] - cx, p[1] - cy)
+
+        radii = [_radius(p) for p in point_coords]
+        r_min_all = min(radii)
+        r_max_all = max(radii)
+
+        contour_stats = {}
+        for idx, p in enumerate(point_coords):
+            root = uf.find(idx)
+            r = radii[idx]
+            st = contour_stats.get(root)
+            if st is None:
+                contour_stats[root] = {"points": 1, "r_min": r, "r_max": r}
+            else:
+                st["points"] += 1
+                if r < st["r_min"]:
+                    st["r_min"] = r
+                if r > st["r_max"]:
+                    st["r_max"] = r
+
+        contours = sorted(contour_stats.values(), key=lambda c: c["r_max"], reverse=True)
+
+        sections.append({
+            "z_requested": z_req,
+            "z_used": z_used,
+            "nudged": nudged,
+            "n_points": n_points,
+            "bbox": {plane_labels[0] + "_min": bbox_min[0], plane_labels[1] + "_min": bbox_min[1],
+                     plane_labels[0] + "_max": bbox_max[0], plane_labels[1] + "_max": bbox_max[1]},
+            "extent": list(extent),
+            "center": [cx, cy],
+            "r_min": r_min_all,
+            "r_max": r_max_all,
+            "contours": contours,
+        })
+
+    return {
+        "path": path,
+        "axis": axis,
+        "plane_axes": list(plane_labels),
+        "sections": sections,
+    }
+
+
+def _format_mesh_section(r: dict) -> str:
+    """Formata o dict de mesh_section() como texto legível."""
+    a1, a2 = r["plane_axes"]
+    lines = [f"✂ Corte de Malha — eixo {r['axis']} (plano {a1}{a2})"]
+    for s in r["sections"]:
+        lines.append("")
+        z_line = f"z_solicitado={s['z_requested']:.4f}"
+        if s["nudged"]:
+            z_line += f" → deslocado para {s['z_used']:.4f} (coincidia com anel de vértices)"
+        lines.append(z_line)
+        if s["n_points"] == 0:
+            lines.append("  Sem interseção (plano fora do bounding box da malha).")
+            continue
+        lines.append(f"  Pontos: {s['n_points']} | Extensão ({a1},{a2}): {[round(x, 3) for x in s['extent']]}mm")
+        lines.append(
+            f"  Centro usado: ({s['center'][0]:.3f}, {s['center'][1]:.3f}) | "
+            f"r_min={s['r_min']:.3f} r_max={s['r_max']:.3f}"
+        )
+        lines.append(f"  Contornos: {len(s['contours'])}")
+        for i, c in enumerate(s["contours"]):
+            lines.append(f"    [{i}] pontos={c['points']} r_min={c['r_min']:.3f} r_max={c['r_max']:.3f}")
+        if len(s["contours"]) >= 2:
+            outer, inner = s["contours"][0], s["contours"][1]
+            d_ext = 2 * outer["r_max"]
+            d_int = 2 * inner["r_max"]
+            wall = outer["r_max"] - inner["r_max"]
+            lines.append(f"  Ø externo {d_ext:.3f} | Ø interno {d_int:.3f} | parede {wall:.3f}")
+            lines.append(
+                "  (diâmetros e parede usam r_max — raio nominal dos vértices; "
+                "r_min é o apótema do polígono $fn)"
+            )
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────
 # Registro das ferramentas MCP
 # ──────────────────────────────────────────────
 @server.list_tools()
@@ -3508,6 +3748,56 @@ async def handle_list_tools() -> list:
                 },
             }
         ),
+        types.Tool(
+            name="mesh_section",
+            description=(
+                "Corta um STL (binário ou ASCII) ou código OpenSCAD por um ou mais planos perpendiculares "
+                "a um eixo, para fit-check de encaixes/press-fits. Retorna pontos de interseção, bbox no "
+                "plano, extensão, r_min/r_max a partir de um centro e os contornos (loops) encontrados — "
+                "para um tubo oco, contours[0] é a parede externa e contours[1] é o furo. "
+                "Aceita 'stl_path' (arquivo já existente) OU 'scad_code' (exporta STL internamente antes de cortar)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "stl_path": {
+                        "type": "string",
+                        "description": "Caminho para um arquivo .stl existente (alternativa a scad_code)"
+                    },
+                    "scad_code": {
+                        "type": "string",
+                        "description": "Código OpenSCAD a exportar (STL) e cortar (alternativa a stl_path)"
+                    },
+                    "variables": {
+                        "type": "object",
+                        "description": "Variáveis -D quando usando scad_code"
+                    },
+                    "timeout_s": {
+                        "type": "number",
+                        "description": "Timeout do export quando usando scad_code, em segundos (default 60, max 900)"
+                    },
+                    "z": {
+                        "type": "number",
+                        "description": "Altura única de corte (alternativa a z_list)"
+                    },
+                    "z_list": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "Lista de alturas de corte (máx. 50) — alternativa a z"
+                    },
+                    "axis": {
+                        "type": "string",
+                        "enum": ["x", "y", "z"],
+                        "description": "Eixo perpendicular ao plano de corte (default 'z')"
+                    },
+                    "center": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "[c1, c2] no plano de corte para medidas radiais (default: centroide dos pontos)"
+                    },
+                },
+            }
+        ),
     ]
 
 
@@ -3575,6 +3865,40 @@ async def _generate_and_export(
     except Exception as e:
         results.append(f"❌ Erro PNG: {e}")
         return [types.TextContent(type="text", text="\n".join(results))]
+
+
+async def _resolve_stl_input(arguments: dict) -> tuple:
+    """
+    Resolve a entrada compartilhada por analyze_mesh e mesh_section:
+    'stl_path' (validado) ou 'scad_code' (exportado para STL via run_openscad).
+    Assume que o chamador já validou que ao menos um dos dois está presente.
+
+    Retorna (target_path, tmp_generated) — tmp_generated é o path a remover
+    depois de usar (arquivo temporário gerado a partir de scad_code), ou
+    None quando target_path veio de um stl_path já existente.
+    """
+    stl_path = arguments.get("stl_path")
+    if stl_path:
+        resolved_path = validate_output_path(stl_path)
+        if not os.path.isfile(resolved_path):
+            raise ValueError(f"Arquivo STL não encontrado: {resolved_path}")
+        return resolved_path, None
+
+    scad_code = arguments["scad_code"]
+    variables = arguments.get("variables", {})
+    timeout_s = arguments.get("timeout_s", RENDER_TIMEOUT_DEFAULT)
+    extra_args = []
+    for k, v in variables.items():
+        if isinstance(v, str):
+            escaped_v = str(v).replace('"', '\\"')
+            extra_args.extend(["-D", f'{k}="{escaped_v}"'])
+        elif isinstance(v, bool):
+            extra_args.extend(["-D", f'{k}={"true" if v else "false"}'])
+        else:
+            extra_args.extend(["-D", f"{k}={v}"])
+    target_path, _ = await run_openscad(scad_code, "stl", extra_args, timeout_s=timeout_s)
+    return target_path, target_path
+
 
 @server.call_tool()
 async def handle_call_tool(
@@ -3991,9 +4315,7 @@ async def handle_call_tool(
         return [types.TextContent(type="text", text="\n".join(lines))]
 
     elif name == "analyze_mesh":
-        stl_path = arguments.get("stl_path")
-        scad_code_mesh = arguments.get("scad_code")
-        if not stl_path and not scad_code_mesh:
+        if not arguments.get("stl_path") and not arguments.get("scad_code"):
             raise ValueError("Forneça 'stl_path' ou 'scad_code'.")
 
         overhang_deg = arguments.get("overhang_deg", 45.0)
@@ -4002,28 +4324,35 @@ async def handle_call_tool(
 
         tmp_generated = None
         try:
-            if stl_path:
-                resolved_path = validate_output_path(stl_path)
-                if not os.path.isfile(resolved_path):
-                    raise ValueError(f"Arquivo STL não encontrado: {resolved_path}")
-                target_path = resolved_path
-            else:
-                variables = arguments.get("variables", {})
-                timeout_s = arguments.get("timeout_s", RENDER_TIMEOUT_DEFAULT)
-                extra_args = []
-                for k, v in variables.items():
-                    if isinstance(v, str):
-                        escaped_v = str(v).replace('"', '\\"')
-                        extra_args.extend(["-D", f'{k}="{escaped_v}"'])
-                    elif isinstance(v, bool):
-                        extra_args.extend(["-D", f'{k}={"true" if v else "false"}'])
-                    else:
-                        extra_args.extend(["-D", f"{k}={v}"])
-                target_path, _ = await run_openscad(scad_code_mesh, "stl", extra_args, timeout_s=timeout_s)
-                tmp_generated = target_path
-
+            target_path, tmp_generated = await _resolve_stl_input(arguments)
             result = analyze_mesh(target_path, overhang_deg=overhang_deg, bed_tol=bed_tol, layer_h=layer_h)
             return [types.TextContent(type="text", text=_format_mesh_analysis(result))]
+        except Exception as e:
+            return [types.TextContent(type="text", text=f"❌ {e}")]
+        finally:
+            if tmp_generated and os.path.exists(tmp_generated):
+                try:
+                    os.remove(tmp_generated)
+                except Exception:
+                    pass
+
+    elif name == "mesh_section":
+        if not arguments.get("stl_path") and not arguments.get("scad_code"):
+            raise ValueError("Forneça 'stl_path' ou 'scad_code'.")
+
+        z = arguments.get("z")
+        z_list = arguments.get("z_list")
+        if z is None and not z_list:
+            raise ValueError("Forneça 'z' ou 'z_list'.")
+        zs = list(z_list) if z_list else [z]
+        axis = arguments.get("axis", "z")
+        center = arguments.get("center")
+
+        tmp_generated = None
+        try:
+            target_path, tmp_generated = await _resolve_stl_input(arguments)
+            result = mesh_section(target_path, zs, axis=axis, center=center)
+            return [types.TextContent(type="text", text=_format_mesh_section(result))]
         except Exception as e:
             return [types.TextContent(type="text", text=f"❌ {e}")]
         finally:
@@ -4044,7 +4373,7 @@ async def main():
             write_stream,
             InitializationOptions(
                 server_name="mcp-openscad",
-                server_version="0.7.0",
+                server_version="0.8.0",
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},
