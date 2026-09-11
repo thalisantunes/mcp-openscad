@@ -1,5 +1,7 @@
 # mcp-openscad
 
+<!-- mcp-name: io.github.thalisantunes/mcp-openscad -->
+
 ![CI](https://github.com/thalisantunes/mcp-openscad/actions/workflows/test.yml/badge.svg)
 ![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)

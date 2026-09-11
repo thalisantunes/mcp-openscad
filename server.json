@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.thalisantunes/mcp-openscad",
+  "title": "OpenSCAD MCP",
+  "description": "OpenSCAD: generate, render, analyse and export parametric CAD for fabrication.",
+  "version": "0.8.0",
+  "repository": {
+    "url": "https://github.com/thalisantunes/mcp-openscad",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "mcp-openscad",
+      "version": "0.8.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "MCP_OPENSCAD_ALLOWED_PATHS",
+          "description": "Colon-separated directories the server may write output to (default: home, /tmp, /var/tmp)"
+        }
+      ]
+    }
+  ]
+}
