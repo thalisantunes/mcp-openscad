@@ -2571,6 +2571,73 @@ def _write_ascii_stl(path, triangles):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _parse_stl: detecção binário vs. ASCII (v0.8.1 — bugfix produção)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_parse_stl_ascii_matching_binary_size_still_parses_as_ascii(tmp_path):
+    """
+    Bug original: um STL ASCII cujo tamanho em bytes calha de bater com a
+    fórmula binária (84 + 50*n) — ex.: ~1 em 50 arquivos ASCII do OpenSCAD
+    2021.01 — era detectado (e parseado) como binário, produzindo lixo
+    (bbox em escala 1e34). Preenchemos o arquivo com espaços em branco até
+    o tamanho bater com a fórmula binária por coincidência, e confirmamos
+    que ainda assim é reconhecido como ASCII (pelo conteúdo, não tamanho)
+    e produz o bbox correto do cubo de 10mm.
+    """
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube_ascii_padded.stl"
+    _write_ascii_stl(str(p), tris)
+
+    size = os.path.getsize(str(p))
+    remainder = (size - 84) % 50
+    if remainder != 0:
+        pad = 50 - remainder
+        with open(p, "a") as f:
+            f.write("\n" + " " * (pad - 1))
+    size2 = os.path.getsize(str(p))
+    assert size2 >= 84 and (size2 - 84) % 50 == 0, "setup falhou em produzir o tamanho ambíguo"
+
+    r = server.analyze_mesh(str(p))
+    assert r["triangles"] == 12
+    assert r["bbox"]["min"] == [0.0, 0.0, 0.0]
+    assert r["bbox"]["max"] == [10.0, 10.0, 10.0]
+    assert r["volume_mm3"] == pytest.approx(1000.0, rel=1e-3)
+
+
+def test_parse_stl_binary_with_solid_header_still_detected_as_binary(tmp_path):
+    """Exportador binário que grava literalmente 'solid' no header de 80 bytes."""
+    tris = _box_triangles(size=(10, 10, 10))
+    p = tmp_path / "cube_binary_solid_header.stl"
+    header = b"solid " + b"\x00" * 74
+    assert len(header) == 80
+    with open(p, "wb") as f:
+        f.write(header)
+        f.write(struct.pack("<I", len(tris)))
+        for v1, v2, v3 in tris:
+            f.write(struct.pack("<3f", 0.0, 0.0, 0.0))
+            f.write(struct.pack("<3f", *v1))
+            f.write(struct.pack("<3f", *v2))
+            f.write(struct.pack("<3f", *v3))
+            f.write(struct.pack("<H", 0))
+
+    r = server.analyze_mesh(str(p))
+    assert r["triangles"] == 12
+    assert r["volume_mm3"] == pytest.approx(1000.0, rel=1e-3)
+
+
+def test_parse_stl_binary_garbage_coords_raise_clear_error(tmp_path):
+    """Se o parse binário produz coordenadas absurdas, deve falhar alto e claro."""
+    n = 5
+    size = 84 + 50 * n
+    p = tmp_path / "garbage.stl"
+    with open(p, "wb") as f:
+        f.write(b"\xff" * size)  # cada float32 decodificado daqui é NaN
+
+    with pytest.raises(ValueError, match="non-finite|misdetected"):
+        server.analyze_mesh(str(p))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # analyze_mesh: parsing + geometria
 # ─────────────────────────────────────────────────────────────────────────────
 

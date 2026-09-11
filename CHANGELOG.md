@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] — 2026-09-10
+
+### Fixed
+- `_parse_stl` (used by `analyze_mesh` and `mesh_section`) detected binary vs. ASCII
+  STL purely by file size (`size == 84 + 50*n`). OpenSCAD 2021.01 exports ASCII by
+  default, so roughly 1 in 50 valid ASCII files happened to have a byte length that
+  also satisfied the binary formula, got misparsed as binary, and produced garbage
+  (observed in production: a bbox at 1e34 scale on a valid file — the same file
+  parsed fine after a trivial geometry edit changed its byte length). Detection is
+  now content-first: if the file starts with `solid` (case-insensitive) and contains
+  `facet` in the first 1KB, or `endsolid` in the last 200 bytes, it's treated as
+  ASCII regardless of size; only files that don't look like ASCII fall back to the
+  size-based binary check (some binary exporters do write a literal `solid` header,
+  hence the extra content check rather than trusting the first 5 bytes alone).
+- The binary parser now validates its own output: a non-finite or `|coordinate| >
+  1e9` value raises a clear `ValueError` ("STL parse produced non-finite/huge
+  coordinates — file may be ASCII misdetected as binary") instead of silently
+  returning garbage geometry.
+
+### Tests
+- **291 tests** (up from 288): an ASCII STL padded to accidentally match the binary
+  size formula still parses correctly (bbox/volume of the 10mm cube), a binary STL
+  with a `solid`-prefixed header still parses as binary, and a garbage-coordinate
+  guard test.
+
 ## [0.8.0] — 2026-09-10
 
 ### Added
