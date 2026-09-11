@@ -6,11 +6,11 @@
 ![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Version](https://img.shields.io/badge/version-0.8.0-blue)
+![Version](https://img.shields.io/badge/version-0.8.1-blue)
 
 > Servidor MCP (Model Context Protocol) que permite agentes de IA interagir com o OpenSCAD para gerar, renderizar e exportar designs CAD paramétricos para fabricação digital — laser cutting, impressão 3D e CNC.
 
-## Versão atual: v0.8.0
+## Versão atual: v0.8.1
 
 ### Ferramentas disponíveis (26)
 

@@ -3,7 +3,7 @@
 ## Projeto
 Servidor MCP para OpenSCAD — geração paramétrica de projetos para corte a laser, impressão 3D e CNC.
 
-- **Versão atual:** v0.8.0
+- **Versão atual:** v0.8.1
 - **Arquivo principal:** `server.py`
 - **Testes:** 288 testes · 94% cobertura
 - **CI:** GitHub Actions (lint + test)

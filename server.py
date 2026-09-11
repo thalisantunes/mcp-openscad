@@ -2541,18 +2541,50 @@ class _UnionFind:
             self.rank[ra] += 1
 
 
+_STL_COORD_LIMIT = 1e9
+
+
+def _detect_stl_binary(path: str, size: int) -> bool:
+    """
+    Decide se um STL é binário ou ASCII.
+
+    Regra base: um STL binário tem tamanho exato de 84 + 50*n bytes
+    (80 bytes de header + 4 bytes de contagem + 50 bytes por triângulo).
+    Mas isso é ambíguo: ~1 em 50 arquivos ASCII válidos calha de ter um
+    tamanho que também satisfaz 84 + 50*n por coincidência (ex.: OpenSCAD
+    2021.01 exporta ASCII por padrão), e alguns exportadores *binários*
+    escrevem literalmente "solid ..." nos primeiros bytes do header de 80
+    bytes, imitando o cabeçalho ASCII.
+
+    Por isso, o conteúdo tem prioridade sobre o tamanho: se o arquivo
+    começa com "solid" (case-insensitive) E contém o token "facet" nos
+    primeiros 1KB, ou "endsolid" nos últimos 200 bytes, é ASCII de
+    verdade — mesmo que o tamanho bata com a fórmula binária. Caso
+    contrário, cai de volta na checagem por tamanho.
+    """
+    with open(path, "rb") as f:
+        head = f.read(5)
+        if head.lower() == b"solid":
+            f.seek(0)
+            first_kb = f.read(1024)
+            if b"facet" in first_kb.lower():
+                return False
+            f.seek(max(0, size - 200))
+            tail = f.read(200)
+            if b"endsolid" in tail.lower():
+                return False
+    return size >= 84 and (size - 84) % 50 == 0
+
+
 def _parse_stl(path: str) -> list:
     """
     Lê um arquivo STL (binário ou ASCII) e retorna lista de triângulos,
     cada um como (v1, v2, v3) com vi = (x, y, z) float.
 
-    Detecção binário vs. ASCII: um STL binário tem tamanho exato de
-    84 + 50*n bytes (80 bytes de header + 4 bytes de contagem + 50 bytes
-    por triângulo — 12 floats de normal/vértices + 2 bytes de atributo).
-    Qualquer outro tamanho é tratado como ASCII.
+    Detecção binário vs. ASCII: ver `_detect_stl_binary`.
     """
     size = os.path.getsize(path)
-    is_binary = size >= 84 and (size - 84) % 50 == 0
+    is_binary = _detect_stl_binary(path, size)
 
     if is_binary:
         n = (size - 84) // 50
@@ -2566,11 +2598,17 @@ def _parse_stl(path: str) -> list:
             # rec = (nx,ny,nz, v1x,v1y,v1z, v2x,v2y,v2z, v3x,v3y,v3z, attr)
             # A normal gravada é ignorada — recalculamos a partir da geometria
             # (mais robusto: alguns exportadores gravam normais zeradas).
-            triangles.append((
-                (rec[3], rec[4], rec[5]),
-                (rec[6], rec[7], rec[8]),
-                (rec[9], rec[10], rec[11]),
-            ))
+            v1 = (rec[3], rec[4], rec[5])
+            v2 = (rec[6], rec[7], rec[8])
+            v3 = (rec[9], rec[10], rec[11])
+            for v in (v1, v2, v3):
+                for c in v:
+                    if not math.isfinite(c) or abs(c) > _STL_COORD_LIMIT:
+                        raise ValueError(
+                            "STL parse produced non-finite/huge coordinates — "
+                            "file may be ASCII misdetected as binary."
+                        )
+            triangles.append((v1, v2, v3))
         return triangles
 
     # ASCII
@@ -4373,7 +4411,7 @@ async def main():
             write_stream,
             InitializationOptions(
                 server_name="mcp-openscad",
-                server_version="0.8.0",
+                server_version="0.8.1",
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},
