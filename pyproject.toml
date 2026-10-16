@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-openscad"
-version = "0.8.1"
+version = "0.9.0"
 description = "MCP server for OpenSCAD — parametric CAD generation for laser cutting, 3D printing, and CNC"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,7 +29,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "mcp>=1.0.0,<2",
+    "mcp>=1.10,<2",
 ]
 
 [project.optional-dependencies]
@@ -48,7 +48,6 @@ Issues = "https://github.com/thalisantunes/mcp-openscad/issues"
 mcp-openscad = "server:main_sync"
 
 [tool.hatch.build.targets.wheel]
-packages = ["."]
 include = ["server.py"]
 
 [tool.pytest.ini_options]

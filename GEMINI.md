@@ -3,12 +3,12 @@
 ## Projeto
 Servidor MCP para OpenSCAD — geração paramétrica de projetos para corte a laser, impressão 3D e CNC.
 
-- **Versão atual:** v0.8.1
+- **Versão atual:** v0.9.0
 - **Arquivo principal:** `server.py`
-- **Testes:** 288 testes · 94% cobertura
+- **Testes:** 424 testes · 94% cobertura
 - **CI:** GitHub Actions (lint + test)
 
-## Ferramentas disponíveis (26)
+## Ferramentas disponíveis (27)
 
 ### Export
 - `render_to_png` — Preview PNG de qualquer código SCAD
@@ -16,6 +16,7 @@ Servidor MCP para OpenSCAD — geração paramétrica de projetos para corte a l
 - `export_3mf` — Exporta 3MF (formato moderno de impressão 3D)
 - `export_dxf` — Exporta DXF para laser / CNC
 - `export_svg` — Exporta SVG para laser / gravação
+- `export_obj` — Exporta OBJ para Blender / Godot (só OpenSCAD nightly)
 - `check_syntax` — Valida sintaxe SCAD sem renderizar (rápido)
 
 ### Laser Cutting
@@ -54,7 +55,7 @@ Servidor MCP para OpenSCAD — geração paramétrica de projetos para corte a l
 ## Como executar
 ```bash
 # Ativar ambiente
-cd /home/thas/projetos/mcp-openscad
+cd ~/dev/pessoais/mcps/mcp-openscad
 source .venv/bin/activate
 
 # Rodar testes
@@ -81,8 +82,6 @@ Ver `ROADMAP.md` para o plano completo de versões.
 11. `analyze_mesh` e `mesh_section` compartilham a entrada `stl_path`/`scad_code` via `_resolve_stl_input()` — reaproveite esse helper para novas ferramentas baseadas em STL
 
 ## Próximas Prioridades
-- Sprint 3: Refatorar `handle_call_tool` (713 linhas → helper `_generate_and_export`)
-- Sprint 4: Reforçar suite de testes (corrigir 3 testes fracos, 83+ cenários faltantes)
 - Sprint 5: Modularizar `server.py` em pacote `mcp_openscad/`
 - v0.5.2: Projetos híbridos laser + 3D
 - v0.5.3: Export profissional (DXF layers, STEP, PDF assembly)

@@ -5,6 +5,162 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-10-16
+
+macOS portability, laser finger joints, and input validation. No tool was removed or
+renamed; one tool was added (27 total).
+
+### Added
+- `export_obj` — new tool: exports a Wavefront OBJ (Blender, Godot). Requires OpenSCAD
+  2022+ (nightly). On 2021.01, which has no OBJ exporter, it answers "OBJ requer OpenSCAD
+  2022+ (nightly)" instead of the raw CLI message.
+- `find_openscad()` — the OpenSCAD binary is now looked up (and cached) in this order:
+  `OPENSCAD_PATH` (if it exists and is executable), `openscad` on `PATH`, then the usual
+  install locations (`/opt/homebrew/bin`, `/usr/local/bin`, `/Applications/OpenSCAD.app`,
+  `/Applications/OpenSCAD-2021.01.app`, `/snap/bin`, `/usr/bin`). GUI hosts such as Claude
+  Desktop do not inherit the shell `PATH`, so the literal `openscad` used to fail on macOS.
+  When nothing is found the error says how to install it or set `OPENSCAD_PATH`, and it
+  names the `OPENSCAD_PATH` value that was rejected, if one was set. `check_syntax` now
+  returns `(False, message)` instead of raising `FileNotFoundError`.
+- CI: a `macos-latest` job (`brew install --cask openscad@snapshot`), `continue-on-error`
+  until it has been verified on a real runner.
+- `server.json`: documents the `OPENSCAD_PATH` environment variable.
+
+### Fixed
+- **Right-hand finger joints in the wrong place** (`generate_box`, `generate_laser_part`).
+  The right edge of a joint was placed at the loop length instead of the piece width, so
+  slots and tabs only landed correctly when width = depth = height. For a 150×100×60 box
+  the front wall slot was at x=57.2 instead of 147.2 and the side wall tabs at x=60
+  instead of at the end of the wall. The parts did not fit together.
+- `generate_laser_part` floor: the side-wall slots were only on the left edge, and on both
+  edges they started at `y = 0`. The side walls sit between the front and back walls, so
+  they start at `y = t`, and their bottom teeth landed 3 mm off the slots (slots at 0 to 18.9,
+  teeth at 3 to 21.9 for 150×100×60). The slots are now on both edges, at `W - slot` on the
+  right, and start at `y = t`: the teeth fit with only the designed `kerf` clearance left
+  (the floor and side wall interference went from 110 to 34 mm³ per wall).
+- `generate_box` did not assemble. The side walls were `D` long, but the space between the
+  front and back walls is `D - 2t` (the dividers and the lid ring already used it), so their
+  vertical teeth fell outside the front and back walls. The floor's side slots used the odd
+  fingers while the side walls' bottom teeth use the even ones, and the 3D assembly put the
+  floor beside the walls instead of under them, the back wall outside the floor and the side
+  walls at `y = 0`. It now
+  follows the model of `generate_laser_part`: the side wall is `D - 2t` long, the floor slots
+  reuse the teeth's fingers shifted by `t`, and the layout, the dividers' position, the
+  material estimate and `assembly_3d` agree with it. For 150×100×60 with 5 fingers the floor
+  slots moved from Y 20.1-39.9 and 60.1-79.9 to 3.0-21.7, 40.7-59.3 and 78.3-97.0, which is
+  where the side wall's teeth are. The side wall went from 100 to 94 mm.
+- `generate_laser_part`: `openings` on the `left` and `right` walls were accepted by the
+  validation and then silently not drawn. They are now rejected with "openings só em
+  front/back nesta versão", and `validate_laser_config` reports them as a warning.
+- `generate_box` dividers: X dividers were laid out on top of the walls in the 2D layout
+  (the SVG/DXF merged them), and `dividers_y` cut the floor slots but produced no pieces.
+  Divider pieces now follow the last wall in the layout, X dividers first and then Y.
+- `generate_box` lid: the snap/slide lid was laid out at `y = H + gap`, on top of the floor
+  (which spans `0..D`) whenever the depth exceeded the height plus the gap, as in the
+  README example. The SVG/DXF fused them: 9 contours instead of 10. The lid now sits at
+  `D + gap`.
+- `run_openscad` accepted any output file that existed, even with a non-zero exit code.
+  On OpenSCAD 2021.01 without a display, PNG rendering segfaults and leaves a
+  0-byte file, which `render_to_png` reported as "Rendered successfully" with an empty
+  image. It now fails with `OpenSCAD Error: exit code N` (`-11` for the segfault) when the
+  exit code is non-zero or the output is missing or empty, and deletes the leftover file.
+- `validate_output_path`: now resolves symlinks (`realpath`) on the path and on every
+  allowed prefix and compares with `commonpath`. Before, `/tmpevil/x` matched `/tmp`, a
+  symlink inside `/tmp` could point anywhere, and on macOS `/private/tmp` and
+  `/var/folders/...` (what `tempfile.gettempdir()` returns) were rejected, which made 22 of
+  the tests fail there. The system temp dir is in the default allow-list; the
+  `MCP_OPENSCAD_ALLOWED_PATHS` separator is `os.pathsep`.
+- `variables` (`-D`) injection: the name is validated (`^\$?[A-Za-z_][A-Za-z0-9_]*$`), the
+  value must be bool, number, string or a list of numbers, and strings escape `\` before
+  `"`. OpenSCAD evaluates `-D a=1;stmt` as code, so a crafted name or value could add
+  geometry or import files. Shared by `render_to_png`, `export_*`, `analyze_mesh` and
+  `mesh_section`.
+- `import()`/`surface()` filter: comments are stripped (string-aware, so `"//"` inside a
+  string does not hide code) before checking, and `import_stl`, `import_off`, `import_dxf`
+  are blocked too. `import/**/("x.stl")` and `import_stl("x.stl")` used to pass. The
+  policy is unchanged: file-reading functions stay prohibited.
+- Banned keywords match whole words (plus a plural `s`) instead of substrings, so
+  `begun`, `gunmetal`, `gun2` and `bombay` pass while `gun`, `guns` and `bomb` are still
+  blocked. Only letters and digits glue to a word: `_` separates, so `water_gun_prop`,
+  `pistol_grip`, `gun_barrel` and `ar15_receiver` stay blocked.
+- `generate_assembly`: a piece name was used as a file name unchecked, so `../../x` wrote
+  outside `output_dir`. `/` and `\` in a name are now rejected before anything is written.
+  The rest is sanitized for both the file and the SCAD module name: accents lose their mark
+  and anything that is not a letter, digit, `_` or `-` becomes `_` (`peça 1.b` becomes
+  `peca_1_b`). A dot used to produce an invalid `module piece_a.b()`.
+- `export_stl`/`export_3mf`/`export_dxf`/`export_svg`: `output_path` must now end with the
+  tool's extension (case-insensitive), so a tool can no longer overwrite an arbitrary
+  existing file with a different format. Overwriting a file with the right extension is
+  unchanged.
+- `check_syntax`: flagged `echo("no error here")` as invalid because it looked for the
+  substring "error". It now fails on a non-zero exit code or on lines starting with
+  `ERROR:`, and reports `WARNING:` and `ECHO:` lines as warnings. It also switched the
+  probe from an SVG render to a CSG export: that only parses and evaluates the model, so a
+  valid 3D model no longer exits with code 1 ("not a 2D object") and a heavy model no longer
+  times out after 15 s on 2021.01 (the limit is kept).
+- `generate_bracket`: the L bracket gusset was drawn in the XY plane and extruded along Z,
+  so a 40×40×20 part came out 37 mm deep. It is now a triangle in the YZ plane with the
+  thickness along X, inside the part.
+- `analyze_mesh` and `mesh_section` ran their pure-Python geometry on the event loop and
+  blocked the server (1.8 s on a 130k-triangle mesh). They now run in a worker thread.
+- Cancelling a call left the `openscad` process running until it finished (up to
+  `timeout_s`, 900 s at most). `run_openscad` and `check_syntax` now kill it on
+  cancellation, and `run_openscad` also deletes the partial output file.
+- Text files (temporary `.scad`, generated `.scad`, assembly pieces and BOM) are written
+  as UTF-8. Without an explicit encoding Python used the locale, and `generate_kerf_test`
+  crashed with `UnicodeEncodeError` on `—` where UTF-8 mode was off.
+
+### Changed
+- `mcp>=1.10,<2` (was `>=1.0.0`): the SDK only validates `inputSchema` (`required`,
+  including `output_dir`) from 1.10.0 on; older versions skipped the path sanitation.
+- Packaging: dropped `packages = ["."]` from the wheel target. The wheel used to ship
+  `README.md`, `LICENSE`, `Dockerfile`, `skills/` and the CI files into `site-packages`;
+  it now contains only `server.py` and the dist-info.
+- Version is 0.9.0 in `pyproject.toml`, `server.json` (both places) and the MCP handshake.
+- Removed the unused `import subprocess`. Cleared 11 of the 14 pre-existing `ruff`
+  findings (`E,F,W`): whitespace on blank lines, `f` prefix on strings without
+  placeholders, an unused exception variable. The other three are unused assignments
+  (`F841`) that were left alone and stay visible in the lint output.
+- The inner helpers `side_finger_loop` and `tabs_side` now take `edge` as a required
+  keyword argument.
+
+### Known issues
+- `suggest_orientation` reads `profile` (`fdm_standard`, `fdm_fine`, `resin`) but never
+  uses it, so the option has no effect. `ruff` reports it as `F841`, along with two other
+  unused assignments in `validate_config` and `generate_cnc_toolpath_hints`.
+
+### Docs
+- README: macOS install (`brew install --cask openscad@snapshot`; the `openscad` cask is
+  disabled), Python >= 3.10, `uvx --from git+...`, `claude mcp add`, Claude Desktop config
+  with absolute paths and an `env` block, environment variables, skill install, required
+  parameters of every tool, new examples, limitations and troubleshooting.
+- ROADMAP and GEMINI brought up to date.
+- CONTRIBUTING: setup with `uv sync --extra dev` (or a venv) and `OPENSCAD_PATH` instead
+  of requiring `openscad` on the `PATH`.
+
+### Tests
+- **424 tests** (up from 291). New: binary lookup (precedence, fallbacks, cache,
+  message), path validation (sibling prefix, symlinks, symlinked prefix, system temp dir),
+  failed and empty output, right-hand joints and floor slots of both generators, layout
+  without overlap (dividers and lid, also checked on the SVG contour count), `variables`
+  injection and escaping, filter bypasses, whole-word keywords, openings on side walls,
+  floor slot and side wall tooth alignment of both generators (positions, and the interference
+  measured on the assembled pieces: only the designed `kerf` clearance is left in each joint),
+  piece names, export extensions, `check_syntax` classification, gusset bounding box,
+  worker-thread execution, cancellation (process and partial output), `export_obj` (real on
+  the nightly, simulated for 2021.01) and UTF-8 under a C locale.
+- Existing tests adjusted: tool count 26 → 27; three path assertions compare against
+  `realpath` so they hold on macOS (`/tmp` → `/private/tmp`); the mocked process in
+  `test_run_openscad_custom_timeout_used` now creates its output file, since a missing
+  output is a failure.
+- The six tests that need a real PNG (the plain `render_to_png` handler call, its default
+  camera, custom camera, ortho and custom size variants, and the box PNG render) use a
+  session fixture that renders a cube
+  to PNG once and skips them with "OpenSCAD sem contexto GL (2021.01 sem display)" when
+  OpenSCAD cannot. On 2021.01 without a display they used to pass only because an empty PNG
+  was accepted as success; they now would fail with `OpenSCAD Error: exit code -11`.
+  The CI runs 2021.01 under `xvfb-run` and the nightly renders PNG headless, so they run there.
+
 ## [0.8.1] — 2026-09-10
 
 ### Fixed

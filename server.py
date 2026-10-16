@@ -1,7 +1,8 @@
 import os
 import re
-import subprocess
+import functools
 import tempfile
+import unicodedata
 import asyncio
 import math
 import shutil
@@ -23,26 +24,38 @@ BANNED_KEYWORDS = [
     "propellant", "combustion chamber", "combustion_chamber"
 ]
 
+# Strings entram antes dos comentários na alternação: "//" ou "/*" dentro de uma string não é comentário.
+_SCAD_STRING_OR_COMMENT = re.compile(r'"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*', re.DOTALL)
+_SCAD_FILE_READERS = re.compile(
+    r'(?<![_a-zA-Z0-9])(?:import|import_stl|import_off|import_dxf|surface)\s*\(', re.IGNORECASE
+)
+
+def _strip_scad_comments(code: str) -> str:
+    return _SCAD_STRING_OR_COMMENT.sub(lambda m: m.group(0) if m.group(0).startswith('"') else " ", code)
+
 def verify_safety_guidelines(scad_code: str, project_name: str = ""):
     text = f"{scad_code} {project_name}".lower()
     if "nozzle" in text and ("rocket" in text or "propellant" in text or "thruster" in text):
         raise ValueError("Safety violation: Generation of rocket nozzles/propellants is prohibited.")
     for b in BANNED_KEYWORDS:
-        if b in text:
+        # Por palavra (com plural em "s"), não por substring: "begun" e "gunmetal" passam,
+        # mas "_" separa palavras: "water_gun_prop" e "pistol_grip" continuam bloqueados.
+        if re.search(rf"(?<![a-z0-9]){re.escape(b)}s?(?![a-z0-9])", text):
             raise ValueError(f"Safety violation: Prohibited keyword '{b}' detected.")
-    # Block OpenSCAD file-reading functions in custom code
-    import re as _re
-    if _re.search(r'(?<![_a-zA-Z0-9])import\s*\(|(?<![_a-zA-Z0-9])surface\s*\(', scad_code, _re.IGNORECASE):
+    # Block OpenSCAD file-reading functions in custom code (comments cannot hide the call)
+    if _SCAD_FILE_READERS.search(_strip_scad_comments(scad_code)):
         raise ValueError("Safety violation: OpenSCAD file-reading functions (import, surface) are prohibited.")
 
 def validate_output_path(path: str) -> str:
-    resolved = os.path.abspath(path)
+    resolved = os.path.realpath(os.path.expanduser(path))
     env_paths = os.environ.get("MCP_OPENSCAD_ALLOWED_PATHS", "")
     if env_paths:
-        allowed_prefixes = [p.strip() for p in env_paths.split(":") if p.strip()]
+        allowed_prefixes = [p.strip() for p in env_paths.split(os.pathsep) if p.strip()]
     else:
-        allowed_prefixes = [os.path.expanduser("~"), "/tmp", "/var/tmp"]
-    if not any(resolved.startswith(p) for p in allowed_prefixes):
+        allowed_prefixes = [os.path.expanduser("~"), tempfile.gettempdir(), "/tmp", "/var/tmp"]
+    # realpath nos dois lados: no macOS /tmp -> /private/tmp; commonpath evita "/tmpevil" casar com "/tmp"
+    real_prefixes = [os.path.realpath(p) for p in allowed_prefixes]
+    if not any(os.path.commonpath([resolved, p]) == p for p in real_prefixes):
         raise ValueError(f"Access denied: Path '{resolved}' is outside allowed directories.")
     return resolved
 
@@ -52,7 +65,7 @@ def safe_output_path(output_dir: str, project_name: str) -> tuple[str, str]:
     safe_project_name = safe_project_name.replace("..", "").replace("/", "").replace("\\", "")
     if not safe_project_name or safe_project_name in (".", ".."):
         safe_project_name = "project"
-    
+
     # Clean output_dir
     norm_dir = validate_output_path(output_dir)
     return norm_dir, safe_project_name
@@ -115,8 +128,10 @@ def validate_config_parameters(tool_name: str, config: dict) -> None:
             if not isinstance(op, dict):
                 raise ValueError("Each opening must be a dictionary.")
             wall = op.get("wall")
-            if wall not in ("front", "back", "left", "right"):
-                raise ValueError(f"Opening wall '{wall}' is invalid. Must be 'front', 'back', 'left', or 'right'.")
+            if wall in ("left", "right"):
+                raise ValueError(f"Opening wall '{wall}' is not supported: openings só em front/back nesta versão.")
+            if wall not in ("front", "back"):
+                raise ValueError(f"Opening wall '{wall}' is invalid. Must be 'front' or 'back'.")
             shape = op.get("shape", "rect")
             if shape not in ("rect", "circle"):
                 raise ValueError(f"Opening shape '{shape}' is invalid. Must be 'rect' or 'circle'.")
@@ -235,13 +250,13 @@ def validate_config_parameters(tool_name: str, config: dict) -> None:
             raise ValueError("corner_radius must be at least 1.6 for screw lids to accommodate screw holes.")
         if W <= 2 * wall or D <= 2 * wall or H <= 2 * wall:
             raise ValueError("Dimensions must be greater than twice the wall thickness.")
-        
+
         stod = assert_positive("standoff_d", config.get("standoff_d", 5))
         stoid = assert_positive("standoff_hole_d", config.get("standoff_hole_d", 2.5))
         if stod <= stoid:
             raise ValueError("standoff_d must be greater than standoff_hole_d.")
         assert_positive("standoff_h", config.get("standoff_h", 5))
-        
+
         for s in config.get("pcb_standoffs", []):
             if not isinstance(s, dict):
                 raise ValueError("Each pcb_standoff must be a dictionary.")
@@ -337,7 +352,7 @@ def validate_config_parameters(tool_name: str, config: dict) -> None:
             assert_positive("piece depth (d)", piece.get("d", 10))
             assert_positive("piece height (h)", piece.get("h", 10))
             assert_integer("piece qty", piece.get("qty", 1), 1)
-            
+
             for prop in ("translate", "rotate", "color"):
                 val = piece.get(prop)
                 if val is not None:
@@ -377,6 +392,40 @@ RENDER_TIMEOUT_MAX = 900.0
 RENDER_TIMEOUT_DEFAULT = 60.0
 
 
+# Locais conhecidos, usados quando o OpenSCAD não está no PATH (apps GUI como o Claude Desktop
+# não herdam o PATH do shell): Homebrew (Apple Silicon e Intel), .app do macOS, snap e apt.
+_OPENSCAD_FALLBACK_PATHS = [
+    "/opt/homebrew/bin/openscad",
+    "/usr/local/bin/openscad",
+    "/Applications/OpenSCAD.app/Contents/MacOS/OpenSCAD",
+    "/Applications/OpenSCAD-2021.01.app/Contents/MacOS/OpenSCAD",
+    "/snap/bin/openscad",
+    "/usr/bin/openscad",
+]
+
+
+@functools.lru_cache(maxsize=None)
+def find_openscad() -> str:
+    """Localiza o binário: OPENSCAD_PATH (env) > PATH > locais conhecidos. Levanta RuntimeError se nada servir."""
+    def usable(path):
+        return os.path.isfile(path) and os.access(path, os.X_OK)
+
+    env_path = os.environ.get("OPENSCAD_PATH")
+    if env_path and usable(env_path):
+        return env_path
+    on_path = shutil.which("openscad")
+    if on_path:
+        return on_path
+    for candidate in _OPENSCAD_FALLBACK_PATHS:
+        if usable(candidate):
+            return candidate
+    rejected = f". OPENSCAD_PATH={env_path!r} foi ignorado: o arquivo não existe ou não é executável." if env_path else ""
+    raise RuntimeError(
+        "OpenSCAD não encontrado. Instale (macOS: brew install --cask openscad@snapshot; "
+        "Linux: openscad.org/downloads) ou defina OPENSCAD_PATH=/caminho/do/binario" + rejected
+    )
+
+
 def _clamp_timeout(timeout_s) -> float:
     """Normaliza e limita timeout_s ao intervalo [RENDER_TIMEOUT_MIN, RENDER_TIMEOUT_MAX]."""
     try:
@@ -395,17 +444,18 @@ async def run_openscad(
     timeout_s: float = RENDER_TIMEOUT_DEFAULT,
 ) -> tuple:
     verify_safety_guidelines(scad_code)
+    openscad = find_openscad()
     if export_args is None:
         export_args = []
     timeout_s = _clamp_timeout(timeout_s)
 
-    with tempfile.NamedTemporaryFile(suffix=".scad", delete=False, mode='w') as f:
+    with tempfile.NamedTemporaryFile(suffix=".scad", delete=False, mode='w', encoding="utf-8") as f:
         f.write(scad_code)
         scad_path = f.name
 
     out_path = os.path.splitext(scad_path)[0] + f".{output_ext}"
 
-    cmd = ["openscad", "-o", out_path] + export_args + [scad_path]
+    cmd = [openscad, "-o", out_path] + export_args + [scad_path]
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -423,14 +473,29 @@ async def run_openscad(
                 except Exception:
                     pass
             raise RuntimeError(f"OpenSCAD Error: Execution timed out after {timeout_s:g} seconds.")
+        except asyncio.CancelledError:
+            proc.kill()
+            if os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    pass
+            raise
         stdout = stdout_b.decode("utf-8", errors="replace")
         stderr = stderr_b.decode("utf-8", errors="replace")
-        if proc.returncode != 0 and not os.path.exists(out_path):
-            raise RuntimeError(f"OpenSCAD Error:\n{stderr}")
+        # returncode != 0 também conta mesmo que sobre um arquivo (ex.: PNG de 0 bytes após segfault sem GL)
+        if proc.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            if os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    pass
+            reason = f"exit code {proc.returncode}" if proc.returncode != 0 else "no output produced"
+            raise RuntimeError(f"OpenSCAD Error: {reason}\n{stderr}")
         return TempFilePath(out_path), stdout + stderr
     except RuntimeError:
         raise
-    except Exception as e:
+    except Exception:
         if os.path.exists(out_path):
             try:
                 os.remove(out_path)
@@ -454,13 +519,19 @@ async def check_scad_syntax(scad_code: str) -> tuple:
     Retorna (is_valid, message).
     """
     verify_safety_guidelines(scad_code)
-    with tempfile.NamedTemporaryFile(suffix=".scad", delete=False, mode='w') as f:
+    try:
+        openscad = find_openscad()
+    except RuntimeError as e:
+        return False, f"❌ {e}"
+    with tempfile.NamedTemporaryFile(suffix=".scad", delete=False, mode='w', encoding="utf-8") as f:
         f.write(scad_code)
         scad_path = f.name
 
     try:
+        # csg: só parseia e avalia, sem gerar geometria. Formatos de malha (svg/stl) devolvem
+        # returncode 1 num modelo válido de outra dimensão ("not a 2D object"), o que confundiria o returncode.
         proc = await asyncio.create_subprocess_exec(
-            "openscad", "--export-format", "svg", "-o", os.devnull, scad_path,
+            openscad, "--export-format", "csg", "-o", os.devnull, scad_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -470,11 +541,16 @@ async def check_scad_syntax(scad_code: str) -> tuple:
             proc.kill()
             await proc.communicate()
             return False, "❌ Timeout ao verificar sintaxe."
+        except asyncio.CancelledError:
+            proc.kill()
+            raise
         stderr = stderr_b.decode("utf-8", errors="replace").strip()
-        errors = [ln for ln in stderr.splitlines() if "ERROR" in ln or "error" in ln.lower()]
+        errors = [ln for ln in stderr.splitlines() if ln.startswith("ERROR:")]
         if errors:
             return False, "Erros encontrados:\n" + "\n".join(errors)
-        warnings = [ln for ln in stderr.splitlines() if "WARNING" in ln or "ECHO" in ln]
+        if proc.returncode != 0:
+            return False, f"Erros encontrados: OpenSCAD terminou com código {proc.returncode}.\n{stderr}".rstrip()
+        warnings = [ln for ln in stderr.splitlines() if ln.startswith(("WARNING:", "ECHO:"))]
         if warnings:
             return True, "✅ Sintaxe válida (com avisos):\n" + "\n".join(warnings)
         return True, "✅ Sintaxe válida — nenhum problema encontrado."
@@ -505,7 +581,8 @@ def generate_laser_scad(config: dict) -> str:
     gap  = 15
 
     def finger_loop_with_exclusions(total_len, n_fingers, exclusions, axis='x',
-                                    is_tab=True, depth=None, y_override=None):
+                                    is_tab=True, depth=None, y_override=None, start=0):
+        # start = onde o loop começa ao longo do eixo (a lateral começa em y=t, depois da parede frontal)
         if depth is None:
             depth = t
         fw = total_len / n_fingers
@@ -520,20 +597,21 @@ def generate_laser_scad(config: dict) -> str:
             if axis == 'x':
                 if is_tab:
                     y_val = f"{-depth:.4f}" if y_override is None else y_override
-                    lines.append(f"        translate([{x0:.4f}, {y_val}]) square([{x1-x0:.4f}, {depth:.4f}]);")
+                    lines.append(f"        translate([{x0 + start:.4f}, {y_val}]) square([{x1-x0:.4f}, {depth:.4f}]);")
                 else:
                     y_val = "0" if y_override is None else y_override
-                    lines.append(f"        translate([{x0:.4f}, {y_val}]) square([{x1-x0:.4f}, {slot:.4f}]);")
+                    lines.append(f"        translate([{x0 + start:.4f}, {y_val}]) square([{x1-x0:.4f}, {slot:.4f}]);")
             else:
                 if is_tab:
                     x_val = f"{-depth:.4f}" if y_override is None else y_override
-                    lines.append(f"        translate([{x_val}, {x0:.4f}]) square([{depth:.4f}, {x1-x0:.4f}]);")
+                    lines.append(f"        translate([{x_val}, {x0 + start:.4f}]) square([{depth:.4f}, {x1-x0:.4f}]);")
                 else:
                     x_val = "0" if y_override is None else y_override
-                    lines.append(f"        translate([{x_val}, {x0:.4f}]) square([{slot:.4f}, {x1-x0:.4f}]);")
+                    lines.append(f"        translate([{x_val}, {x0 + start:.4f}]) square([{slot:.4f}, {x1-x0:.4f}]);")
         return "\n".join(lines)
 
-    def side_finger_loop(total_len, n_fingers, is_tab=True, depth=None, side='left'):
+    def side_finger_loop(total_len, n_fingers, is_tab=True, depth=None, side='left', *, edge):
+        # total_len = comprimento ao longo da borda (eixo Y); edge = X da borda direita da peça
         if depth is None:
             depth = t
         fw = total_len / n_fingers
@@ -542,10 +620,10 @@ def generate_laser_scad(config: dict) -> str:
             y0 = i * fw + (kerf / 2 if not is_tab else -kerf / 2)
             y1 = (i + 1) * fw + (-kerf / 2 if not is_tab else kerf / 2)
             if is_tab:
-                offset = -depth if side == 'left' else total_len
+                offset = -depth if side == 'left' else edge
                 lines.append(f"        translate([{offset:.4f}, {y0:.4f}]) square([{depth:.4f}, {y1-y0:.4f}]);")
             else:
-                offset = 0 if side == 'left' else total_len - slot
+                offset = 0 if side == 'left' else edge - slot
                 lines.append(f"        translate([{offset:.4f}, {y0:.4f}]) square([{slot:.4f}, {y1-y0:.4f}]);")
         return "\n".join(lines)
 
@@ -588,6 +666,10 @@ def generate_laser_scad(config: dict) -> str:
     back_tabs   = finger_loop_with_exclusions(W, N, back_excl,  axis='x', is_tab=True)
     floor_f_slots = finger_loop_with_exclusions(W, N, front_excl, axis='x', is_tab=False)
     floor_b_slots_translated = finger_loop_with_exclusions(W, N, back_excl, axis='x', is_tab=False, y_override="D-slot")
+    floor_left_slots = finger_loop_with_exclusions(side_w, N, [], axis='y', is_tab=False, start=t)
+    floor_right_slots = finger_loop_with_exclusions(
+        side_w, N, [], axis='y', is_tab=False, y_override=f"{W - slot:.4f}", start=t
+    )
 
     front_openings_scad = "\n".join(opening_scad(op) for op in front_ops)
     back_openings_scad  = "\n".join(opening_scad(op) for op in back_ops)
@@ -615,8 +697,8 @@ module front_wall() {{
         // Aberturas (porta, janela...)
 {front_openings_scad}
         // Fendas laterais (recebem dentes da side_wall)
-{side_finger_loop(H, N, is_tab=False, depth=slot, side='left')}
-{side_finger_loop(H, N, is_tab=False, depth=slot, side='right')}
+{side_finger_loop(H, N, is_tab=False, depth=slot, side='left', edge=W)}
+{side_finger_loop(H, N, is_tab=False, depth=slot, side='right', edge=W)}
     }}
 }}
 
@@ -631,8 +713,8 @@ module back_wall() {{
         // Aberturas
 {back_openings_scad}
         // Fendas laterais
-{side_finger_loop(H, N, is_tab=False, depth=slot, side='left')}
-{side_finger_loop(H, N, is_tab=False, depth=slot, side='right')}
+{side_finger_loop(H, N, is_tab=False, depth=slot, side='left', edge=W)}
+{side_finger_loop(H, N, is_tab=False, depth=slot, side='right', edge=W)}
     }}
 }}
 
@@ -641,8 +723,8 @@ module side_wall() {{
     union() {{
         square([side_w, H]);
         // Dentes para front/back (eixo Y)
-{side_finger_loop(H, N, is_tab=True, depth=t, side='left')}
-{side_finger_loop(H, N, is_tab=True, depth=t, side='right')}
+{side_finger_loop(H, N, is_tab=True, depth=t, side='left', edge=side_w)}
+{side_finger_loop(H, N, is_tab=True, depth=t, side='right', edge=side_w)}
         // Dentes inferiores
 {finger_loop_with_exclusions(side_w, N, [], axis='x', is_tab=True)}
     }}
@@ -656,8 +738,9 @@ module floor_base() {{
 {floor_f_slots}
         // Fendas parede traseira (y=D-slot)
 {floor_b_slots_translated}
-        // Fendas paredes laterais
-{finger_loop_with_exclusions(side_w, N, [], axis='y', is_tab=False)}
+        // Fendas paredes laterais (esquerda em x=0, direita em x=W-slot); a lateral começa em y=t
+{floor_left_slots}
+{floor_right_slots}
     }}
 }}
 
@@ -683,8 +766,8 @@ module layout_2d() {{
 
     scad += "\n".join(disk_lines) + "\n}\n\n"
 
-    scad += f"""// ── Assembly 3D ─────────────────────────────────────────────
-module assembly_3d() {{
+    scad += """// ── Assembly 3D ─────────────────────────────────────────────
+module assembly_3d() {
     color([0.9,0.8,0.6])
         translate([0, 0, -t])
             linear_extrude(t) floor_base();
@@ -704,14 +787,14 @@ module assembly_3d() {{
         translate([W-t, t, 0])
             rotate([90,0,90])
                 linear_extrude(t) side_wall();
-}}
+}
 
 RENDER_MODE = "3d";
-if (RENDER_MODE == "2d") {{
+if (RENDER_MODE == "2d") {
     layout_2d();
-}} else {{
+} else {
     assembly_3d();
-}}
+}
 """
     return scad
 
@@ -745,13 +828,18 @@ def generate_box_scad(config: dict) -> str:
     if N % 2 == 0:
         N += 1
 
+    def even_fingers(length, n):
+        """Intervalos (x0, x1) dos dentes pares ao longo de `length`: os da borda inferior das paredes."""
+        fw = length / n
+        return [
+            (i * fw + (0 if i == 0 else kerf / 2), (i + 1) * fw - (0 if i == n - 1 else kerf / 2))
+            for i in range(0, n, 2)
+        ]
+
     def tabs_bottom(length, n, is_tab=True, y_override=None):
         """Dentes/fendas na borda inferior (Y=0)."""
-        fw = length / n
         lines = []
-        for i in range(0, n, 2):
-            x0 = i * fw + (0 if i == 0 else kerf / 2)
-            x1 = (i + 1) * fw - (0 if i == n - 1 else kerf / 2)
+        for x0, x1 in even_fingers(length, n):
             if is_tab:
                 y_val = f"{-t:.3f}" if y_override is None else y_override
                 lines.append(f"    translate([{x0:.3f}, {y_val}]) square([{x1-x0:.3f}, {t:.3f}]);")
@@ -760,23 +848,32 @@ def generate_box_scad(config: dict) -> str:
                 lines.append(f"    translate([{x0:.3f}, {y_val}]) square([{x1-x0:.3f}, {slot:.3f}]);")
         return "\n".join(lines)
 
-    def tabs_side(length, n, is_tab=True, side='left'):
-        """Dentes/fendas nas bordas laterais (X=0 ou X=length)."""
+    def tabs_side(length, n, is_tab=True, side='left', *, edge):
+        """Dentes/fendas nas bordas laterais (X=0 ou X=edge). length = comprimento ao longo da borda."""
         fw = length / n
         lines = []
         for i in range(1, n, 2):
             y0 = i * fw + kerf / 2
             y1 = (i + 1) * fw - kerf / 2
             if is_tab:
-                ox = -t if side == 'left' else length
+                ox = -t if side == 'left' else edge
                 lines.append(f"    translate([{ox:.3f}, {y0:.3f}]) square([{t:.3f}, {y1-y0:.3f}]);")
             else:
-                ox = 0 if side == 'left' else length - slot
+                ox = 0 if side == 'left' else edge - slot
                 lines.append(f"    translate([{ox:.3f}, {y0:.3f}]) square([{slot:.3f}, {y1-y0:.3f}]);")
         return "\n".join(lines)
 
+    def floor_side_slots(length, n, side):
+        """Fendas do piso para os dentes inferiores de uma lateral: os mesmos dedos de tabs_bottom, na borda
+        esquerda (X=0) ou direita (X=W-slot) e a partir de y=t, onde a lateral começa (depois da frontal)."""
+        ox = 0 if side == 'left' else W - slot
+        return "\n".join(
+            f"    translate([{ox:.3f}, {t + y0:.3f}]) square([{slot:.3f}, {y1-y0:.3f}]);"
+            for y0, y1 in even_fingers(length, n)
+        )
+
     inner_w = W - 2 * t
-    inner_d = D - 2 * t
+    inner_d = D - 2 * t      # a lateral cabe entre a frontal e a traseira
 
     # Build back-translated floor slots
     front_slot_lines = tabs_bottom(W, N, is_tab=False)
@@ -785,13 +882,15 @@ def generate_box_scad(config: dict) -> str:
     # Divisórias X (paralelas ao eixo depth, cortam ao longo de D)
     divider_floor_slots = ""
     divider_layout_pieces = ""
+    # As peças das divisórias entram na fila do layout depois da última parede lateral
+    divider_x0 = 3 * (W + gap) + 2 * (inner_d + gap)
     if div_x > 0:
         step = inner_w / (div_x + 1)
         slot_lines = []
         for i in range(div_x):
             xpos = t + step * (i + 1) - t / 2
             slot_lines.append(f"    // Divisória X{i+1}: fenda no piso\n    translate([{xpos:.3f}, {t:.3f}]) square([{slot:.3f}, {inner_d:.3f}]);")
-            lx = (i + 1) * (inner_d + gap) + W + gap
+            lx = divider_x0 + i * (inner_d + gap)
             divider_layout_pieces += f"    translate([{lx:.3f}, 0]) square([{inner_d:.3f}, {H:.3f}]);\n"
         divider_floor_slots = "\n".join(slot_lines)
 
@@ -802,6 +901,8 @@ def generate_box_scad(config: dict) -> str:
         for i in range(div_y):
             ypos = t + step * (i + 1) - t / 2
             slot_lines_y.append(f"    // Divisória Y{i+1}: fenda no piso\n    translate([{t:.3f}, {ypos:.3f}]) square([{inner_w:.3f}, {slot:.3f}]);")
+            ly = divider_x0 + div_x * (inner_d + gap) + i * (inner_w + gap)
+            divider_layout_pieces += f"    translate([{ly:.3f}, 0]) square([{inner_w:.3f}, {H:.3f}]);\n"
         divider_y_floor_slots = "\n".join(slot_lines_y)
 
     # Tampa
@@ -822,7 +923,7 @@ module box_lid() {{
         }}
 }}
 """
-        lid_in_layout = f"    translate([0, {H + gap:.3f}]) box_lid();\n"
+        lid_in_layout = f"    translate([0, {D + gap:.3f}]) box_lid();\n"
     elif lid == "slide":
         lid_module = f"""
 // ── Tampa Deslizante ─────────────────────────────────────────
@@ -830,7 +931,7 @@ module box_lid() {{
     square([{W - lc*2:.3f}, {D - lc*2:.3f}]);
 }}
 """
-        lid_in_layout = f"    translate([0, {H + gap:.3f}]) box_lid();\n"
+        lid_in_layout = f"    translate([0, {D + gap:.3f}]) box_lid();\n"
 
     scad = f"""// ============================================================
 // Caixa Laser — Gerada pelo MCP-OpenSCAD
@@ -843,6 +944,7 @@ D    = {D};
 H    = {H};
 slot = t - kerf;
 gap  = {gap};
+side_d = D - 2*t;   // comprimento da lateral: cabe entre a frontal e a traseira
 
 // ── Piso ─────────────────────────────────────────────────────
 module box_floor() {{
@@ -852,9 +954,9 @@ module box_floor() {{
 {front_slot_lines}
         // Fendas parede traseira
 {back_slots_floor}
-        // Fendas paredes laterais esq/dir
-{tabs_side(D, N, is_tab=False, side='left')}
-{tabs_side(D, N, is_tab=False, side='right')}
+        // Fendas paredes laterais esq/dir (a lateral começa em y=t, depois da frontal)
+{floor_side_slots(inner_d, N, 'left')}
+{floor_side_slots(inner_d, N, 'right')}
 {divider_floor_slots}
 {divider_y_floor_slots}
     }}
@@ -869,20 +971,20 @@ module box_front_wall() {{
 {tabs_bottom(W, N, is_tab=True)}
         }}
         // Fendas para paredes laterais
-{tabs_side(H, N, is_tab=False, side='left')}
-{tabs_side(H, N, is_tab=False, side='right')}
+{tabs_side(H, N, is_tab=False, side='left', edge=W)}
+{tabs_side(H, N, is_tab=False, side='right', edge=W)}
     }}
 }}
 
 // ── Parede Lateral ───────────────────────────────────────────
 module box_side_wall() {{
     union() {{
-        square([D, H]);
+        square([side_d, H]);
         // Dentes para encaixe com piso
-{tabs_bottom(D, N, is_tab=True)}
+{tabs_bottom(inner_d, N, is_tab=True)}
         // Dentes para front/back
-{tabs_side(H, N, is_tab=True, side='left')}
-{tabs_side(H, N, is_tab=True, side='right')}
+{tabs_side(H, N, is_tab=True, side='left', edge=inner_d)}
+{tabs_side(H, N, is_tab=True, side='right', edge=inner_d)}
     }}
 }}
 
@@ -894,29 +996,31 @@ module layout_2d() {{
     translate([{W + gap:.3f}, 0])        box_front_wall();
     translate([{2*(W + gap):.3f}, 0])    box_front_wall();
     translate([{3*(W + gap):.3f}, 0])    box_side_wall();
-    translate([{3*(W + gap) + D + gap:.3f}, 0]) box_side_wall();
+    translate([{3*(W + gap) + inner_d + gap:.3f}, 0]) box_side_wall();
 {divider_layout_pieces}{lid_in_layout}}}
 
 // ── Assembly 3D ───────────────────────────────────────────────
 module assembly_3d() {{
-    // Piso
-    color([0.9, 0.8, 0.6]) linear_extrude(t) box_floor();
+    // Piso (sob as paredes: os dentes inferiores entram nas fendas)
+    color([0.9, 0.8, 0.6])
+        translate([0, 0, -t])
+            linear_extrude(t) box_floor();
     // Frontal
     color([0.9, 0.6, 0.4])
-        translate([0, 0, 0]) rotate([90,0,0])
-            translate([0, 0, {-t:.3f}]) linear_extrude(t) box_front_wall();
+        translate([0, t, 0]) rotate([90,0,0])
+            linear_extrude(t) box_front_wall();
     // Traseira
     color([0.9, 0.5, 0.4])
         translate([0, D, 0]) rotate([90,0,0])
-            translate([0, 0, {-t:.3f}]) linear_extrude(t) box_front_wall();
-    // Lateral esquerda
+            linear_extrude(t) box_front_wall();
+    // Lateral esquerda (entre a frontal e a traseira: começa em y = t)
     color([0.8, 0.5, 0.4])
-        translate([0, 0, 0]) rotate([90,0,90])
+        translate([0, t, 0]) rotate([90,0,90])
             linear_extrude(t) box_side_wall();
     // Lateral direita
     color([0.8, 0.4, 0.6])
-        translate([W, 0, 0]) rotate([90,0,90])
-            translate([0, 0, {-t:.3f}]) linear_extrude(t) box_side_wall();
+        translate([W - t, t, 0]) rotate([90,0,90])
+            linear_extrude(t) box_side_wall();
 }}
 
 RENDER_MODE = "3d";
@@ -963,7 +1067,7 @@ def estimate_material_use(config: dict, sheet_w: float = 600, sheet_h: float = 4
     pieces = [
         {"name": "Piso",             "qty": 1, "w": W, "h": D},
         {"name": "Frontal/Traseira", "qty": 2, "w": W, "h": H},
-        {"name": "Lateral",          "qty": 2, "w": D, "h": H},
+        {"name": "Lateral",          "qty": 2, "w": D - 2*t, "h": H},
     ]
 
     lid = config.get("lid_type", "snap")
@@ -1142,6 +1246,12 @@ def validate_config(config: dict) -> list:
         wall = op.get("wall")
         shape = op.get("shape", "rect")
 
+        if wall in ("left", "right"):
+            warnings.append(
+                f"⚠ [{wall}] Abertura ignorada: openings só em front/back nesta versão."
+            )
+            continue
+
         if shape == "rect" and op.get("y", 999) == 0:
             ox1 = op.get("x", 0)
             ox2 = ox1 + op.get("w", 0)
@@ -1294,8 +1404,8 @@ wall = {wall};
         if gusset:
             gusset_code = f"""            // Reforço diagonal
             translate([{W/2 - wall/2:.3f}, 0, 0])
-                linear_extrude(wall)
-                    polygon([[0, wall], [{dep - wall:.3f}, wall], [wall, {H - wall:.3f}], [0, {H - wall:.3f}]]);
+                rotate([90, 0, 90]) linear_extrude(wall)
+                    polygon([[wall, wall], [dep, wall], [wall, H]]);
 """
         mount_code = ""
         if mh >= 2:
@@ -1457,7 +1567,7 @@ def generate_enclosure_scad(config: dict) -> str:
                 rounded_box(W - 4*wall - 2*tol, D - 4*wall - 2*tol, {wall+0.1:.2f}, max(0.1, cr-2*wall));
         }}"""
     elif lid == "screw":
-        lid_body = f"""    // Furos de parafuso M3 nos cantos
+        lid_body = """    // Furos de parafuso M3 nos cantos
     for (x = [cr, W-cr]) for (y = [cr, D-cr])
         translate([x, y, -0.1]) cylinder(d=3.2, h=bt+0.2);"""
 
@@ -1770,8 +1880,8 @@ $fn = 32;
         scad += pocket_module(f"pocket_{tname}", tw, th, style)
 
     # Layout
-    scad += f"""// ── Layout de teste ──────────────────────────────────────────
-module test_layout() {{
+    scad += """// ── Layout de teste ──────────────────────────────────────────
+module test_layout() {
 """
     x_off = 0
     for tw, th, tname in test_sizes:
@@ -2209,6 +2319,18 @@ def suggest_orientation(config: dict) -> dict:
 # generate_assembly (v0.4.5)
 # ──────────────────────────────────────────────
 
+def _safe_piece_name(piece_name: str) -> str:
+    """
+    Nome de peça seguro para arquivo e para módulo SCAD: ASCII, só [A-Za-z0-9_-].
+    Acentos perdem o sinal ("peça" vira "peca") e o resto vira "_" (espaço, ponto...).
+    Separadores de caminho são recusados em vez de convertidos.
+    """
+    if "/" in piece_name or "\\" in piece_name:
+        raise ValueError(f"Invalid piece name {piece_name!r}: path separators are not allowed.")
+    ascii_name = unicodedata.normalize("NFKD", piece_name.strip()).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", ascii_name) or "piece"
+
+
 def generate_assembly_scad(config: dict) -> tuple:
     """
     Gera projeto multi-peça com posicionamento e BOM automático.
@@ -2255,7 +2377,7 @@ def generate_assembly_scad(config: dict) -> tuple:
         else:
             shape = f"cube([{w}, {d}, {h}])"
 
-        safe_name = name.replace(' ', '_').replace('-', '_')
+        safe_name = _safe_piece_name(name).replace('-', '_')
         module_name = f"piece_{safe_name}"
         piece_modules.append(f"module {module_name}() {{\n    {shape};\n}}")
 
@@ -3337,6 +3459,26 @@ async def handle_list_tools() -> list:
                 "required": ["scad_code", "output_path"]
             }
         ),
+        types.Tool(
+            name="export_obj",
+            description=(
+                "Export 3D OpenSCAD code to a Wavefront OBJ file (Blender, Godot, game engines). "
+                "Requires OpenSCAD 2022+ (nightly); 2021.01 cannot export OBJ."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "variables": {"type": "object"},
+                    "scad_code": {"type": "string"},
+                    "output_path": {"type": "string"},
+                    "timeout_s": {
+                        "type": "number",
+                        "description": "Render timeout in seconds (default 60, max 900)"
+                    },
+                },
+                "required": ["scad_code", "output_path"]
+            }
+        ),
         # check_syntax
         types.Tool(
             name="check_syntax",
@@ -3364,7 +3506,7 @@ async def handle_list_tools() -> list:
                 "properties": {
                     "config": {
                         "type": "object",
-                        "description": "material_thickness, kerf, width, depth, height, fingers, openings[]",
+                        "description": "material_thickness, kerf, width, depth, height, fingers, openings[] (wall: front|back)",
                         "required": ["width", "depth", "height"]
                     },
                     "output_dir": {"type": "string"},
@@ -3877,7 +4019,7 @@ async def _generate_and_export(
     # Salva SCAD
     os.makedirs(output_dir, exist_ok=True)
     scad_path = os.path.join(output_dir, f"{project_name}.scad")
-    with open(scad_path, "w") as f:
+    with open(scad_path, "w", encoding="utf-8") as f:
         f.write(scad_code)
 
     # Exports vetoriais
@@ -3905,6 +4047,39 @@ async def _generate_and_export(
         return [types.TextContent(type="text", text="\n".join(results))]
 
 
+_VARIABLE_NAME = re.compile(r"\$?[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _define_args(variables: dict) -> list:
+    """
+    Converte `variables` em argumentos `-D nome=valor` do OpenSCAD.
+
+    O OpenSCAD avalia `-D` como código, então a chave só pode ser um identificador
+    (opcionalmente `$especial`) e o valor só pode ser bool, número, string (escapada)
+    ou lista de números — nada que consiga encerrar a atribuição e injetar comandos.
+    """
+    args = []
+    for name, value in variables.items():
+        if not isinstance(name, str) or not _VARIABLE_NAME.fullmatch(name):
+            raise ValueError(f"Invalid variable name {name!r}: use a letter or '_' followed by letters, digits or '_'.")
+        if isinstance(value, bool):
+            literal = "true" if value else "false"
+        elif isinstance(value, (int, float)):
+            literal = str(value)
+        elif isinstance(value, str):
+            literal = '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        elif isinstance(value, list) and all(
+            isinstance(item, (int, float)) and not isinstance(item, bool) for item in value
+        ):
+            literal = "[" + ", ".join(str(item) for item in value) + "]"
+        else:
+            raise ValueError(
+                f"Unsupported value for variable {name!r}: use a bool, number, string or list of numbers."
+            )
+        args.extend(["-D", f"{name}={literal}"])
+    return args
+
+
 async def _resolve_stl_input(arguments: dict) -> tuple:
     """
     Resolve a entrada compartilhada por analyze_mesh e mesh_section:
@@ -3925,15 +4100,7 @@ async def _resolve_stl_input(arguments: dict) -> tuple:
     scad_code = arguments["scad_code"]
     variables = arguments.get("variables", {})
     timeout_s = arguments.get("timeout_s", RENDER_TIMEOUT_DEFAULT)
-    extra_args = []
-    for k, v in variables.items():
-        if isinstance(v, str):
-            escaped_v = str(v).replace('"', '\\"')
-            extra_args.extend(["-D", f'{k}="{escaped_v}"'])
-        elif isinstance(v, bool):
-            extra_args.extend(["-D", f'{k}={"true" if v else "false"}'])
-        else:
-            extra_args.extend(["-D", f"{k}={v}"])
+    extra_args = _define_args(variables)
     target_path, _ = await run_openscad(scad_code, "stl", extra_args, timeout_s=timeout_s)
     return target_path, target_path
 
@@ -3963,7 +4130,7 @@ async def handle_call_tool(
     # Path traversal validation/sanitization
     if "output_path" in arguments:
         arguments["output_path"] = validate_output_path(arguments["output_path"])
-    
+
     if "output_dir" in arguments:
         output_dir = arguments.get("output_dir", "/tmp")
         project_name = arguments.get("project_name", "project")
@@ -3983,22 +4150,14 @@ async def handle_call_tool(
             validate_config_parameters(name, arguments["config"])
 
     # ── Exportação básica ──────────────────────────────────────────
-    if name in ["render_to_png", "export_stl", "export_3mf", "export_dxf", "export_svg"]:
+    if name in ["render_to_png", "export_stl", "export_3mf", "export_dxf", "export_svg", "export_obj"]:
         if "scad_code" not in arguments:
             raise ValueError("Missing 'scad_code' argument")
 
         scad_code = arguments["scad_code"]
         variables = arguments.get("variables", {})
         timeout_s = arguments.get("timeout_s", RENDER_TIMEOUT_DEFAULT)
-        extra_args = []
-        for k, v in variables.items():
-            if isinstance(v, str):
-                escaped_v = str(v).replace('"', '\\"')
-                extra_args.extend(["-D", f'{k}="{escaped_v}"'])
-            elif isinstance(v, bool):
-                extra_args.extend(["-D", f'{k}={"true" if v else "false"}'])
-            else:
-                extra_args.extend(["-D", f"{k}={v}"])
+        extra_args = _define_args(variables)
 
         if name == "render_to_png":
             # Camera options
@@ -4048,12 +4207,24 @@ async def handle_call_tool(
                 raise ValueError("Missing 'output_path' argument")
             output_path = arguments["output_path"]
             ext = name.split("_")[1]
+            if os.path.splitext(output_path)[1].lower() != f".{ext}":
+                raise ValueError(
+                    f"output_path must have the .{ext} extension for {name} "
+                    f"(got '{os.path.basename(output_path)}')."
+                )
             out_path = None
             try:
                 out_path, _ = await run_openscad(scad_code, ext, extra_args, timeout_s=timeout_s)
                 shutil.move(out_path, output_path)
                 return [types.TextContent(type="text", text=f"Exported successfully to {output_path}")]
             except Exception as e:
+                if ext == "obj" and "valid suffix" in str(e).lower():
+                    return [types.TextContent(
+                        type="text",
+                        text="OBJ requer OpenSCAD 2022+ (nightly). O OpenSCAD instalado não exporta OBJ; "
+                             "no macOS: brew install --cask openscad@snapshot, ou aponte OPENSCAD_PATH "
+                             "para um binário mais novo.",
+                    )]
                 return [types.TextContent(type="text", text=str(e))]
             finally:
                 if out_path and os.path.exists(out_path):
@@ -4290,10 +4461,11 @@ async def handle_call_tool(
         os.makedirs(output_dir, exist_ok=True)
 
         scad_assembly, piece_scads, bom_md = generate_assembly_scad(config)
+        piece_files = {pname: _safe_piece_name(pname) for pname in piece_scads}  # valida antes de gravar
 
         # Save assembly SCAD
         scad_path = os.path.join(output_dir, f"{project_name}.scad")
-        with open(scad_path, "w") as f:
+        with open(scad_path, "w", encoding="utf-8") as f:
             f.write(scad_assembly)
 
         results = [f"🏗 Assembly gerado: {scad_path}"]
@@ -4302,14 +4474,14 @@ async def handle_call_tool(
         pieces_dir = os.path.join(output_dir, "pieces")
         os.makedirs(pieces_dir, exist_ok=True)
         for pname, pscad in piece_scads.items():
-            ppath = os.path.join(pieces_dir, f"{pname}.scad")
-            with open(ppath, "w") as f:
+            ppath = os.path.join(pieces_dir, f"{piece_files[pname]}.scad")
+            with open(ppath, "w", encoding="utf-8") as f:
                 f.write(pscad)
             results.append(f"  📦 Peça: {ppath}")
 
         # Save BOM
         bom_path = os.path.join(output_dir, f"{project_name}_bom.md")
-        with open(bom_path, "w") as f:
+        with open(bom_path, "w", encoding="utf-8") as f:
             f.write(bom_md)
         results.append(f"📋 BOM: {bom_path}")
 
@@ -4339,7 +4511,7 @@ async def handle_call_tool(
 
         if r["finishing"]:
             f_data = r["finishing"]
-            lines.append(f"✨ Passe de acabamento:")
+            lines.append("✨ Passe de acabamento:")
             lines.append(f"   Feed: {f_data['feed_rate_mm_min']} mm/min | DOC: {f_data['depth_per_pass_mm']}mm")
             lines.append(f"   {f_data['note']}")
             lines.append("")
@@ -4363,7 +4535,9 @@ async def handle_call_tool(
         tmp_generated = None
         try:
             target_path, tmp_generated = await _resolve_stl_input(arguments)
-            result = analyze_mesh(target_path, overhang_deg=overhang_deg, bed_tol=bed_tol, layer_h=layer_h)
+            result = await asyncio.to_thread(
+                analyze_mesh, target_path, overhang_deg=overhang_deg, bed_tol=bed_tol, layer_h=layer_h
+            )
             return [types.TextContent(type="text", text=_format_mesh_analysis(result))]
         except Exception as e:
             return [types.TextContent(type="text", text=f"❌ {e}")]
@@ -4389,7 +4563,7 @@ async def handle_call_tool(
         tmp_generated = None
         try:
             target_path, tmp_generated = await _resolve_stl_input(arguments)
-            result = mesh_section(target_path, zs, axis=axis, center=center)
+            result = await asyncio.to_thread(mesh_section, target_path, zs, axis=axis, center=center)
             return [types.TextContent(type="text", text=_format_mesh_section(result))]
         except Exception as e:
             return [types.TextContent(type="text", text=f"❌ {e}")]
@@ -4411,7 +4585,7 @@ async def main():
             write_stream,
             InitializationOptions(
                 server_name="mcp-openscad",
-                server_version="0.8.1",
+                server_version="0.9.0",
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},
