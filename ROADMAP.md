@@ -4,7 +4,7 @@
 
 ---
 
-## Estado atual — v0.4.0 ✅
+## Estado atual — v0.9.0 ✅
 
 | Ferramenta | Categoria | Descrição |
 |---|---|---|
@@ -13,6 +13,7 @@
 | `export_3mf` | Export | Exporta 3MF (formato moderno de impressão 3D) |
 | `export_dxf` | Export | Exporta DXF para laser / CNC |
 | `export_svg` | Export | Exporta SVG para laser / gravação |
+| `export_obj` | Export | Exporta OBJ para Blender / Godot (só OpenSCAD nightly) |
 | `check_syntax` | Export | Valida sintaxe SCAD sem renderizar (rápido) |
 | `generate_laser_part` | Laser | Gera 2D+3D inteligente para laser com finger joints |
 | `validate_laser_config` | Laser | Detecta problemas geométricos antes de cortar |
@@ -32,8 +33,12 @@
 | `generate_retraction_test` | 3D | Torres para teste de retração |
 | `generate_assembly` | Multi | Projeto multi-peça com vista explodida + BOM |
 | `generate_cnc_toolpath_hints` | CNC | Sugestões de parâmetros CNC por material |
+| `analyze_mesh` | Análise | Analisa STL/SCAD: watertight, componentes flutuantes, volume, overhang e bridges |
+| `mesh_section` | Análise | Corte transversal de STL/SCAD por plano — fit-check de encaixes |
 
-**Testes:** 254 testes · 95% cobertura · CI GitHub Actions
+**Testes:** 424 testes · 94% cobertura · CI GitHub Actions (ubuntu e, experimental, macOS)
+
+**Plataformas:** Linux e macOS. O binário do OpenSCAD é achado por `OPENSCAD_PATH`, `PATH` ou locais conhecidos; OpenSCAD 2021.01 e nightly são suportados (o nightly é o recomendado).
 
 ---
 

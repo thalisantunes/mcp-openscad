@@ -7,18 +7,24 @@ Obrigado pelo interesse em contribuir! 🎉
 ```bash
 git clone https://github.com/thalisantunes/mcp-openscad
 cd mcp-openscad
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
+uv sync --extra dev        # cria o .venv (Python >= 3.10) com o mcp e as ferramentas de teste
+source .venv/bin/activate  # ou prefixe os comandos abaixo com `uv run`
 ```
 
-**Requisito:** [OpenSCAD](https://openscad.org/downloads.html) instalado e no `PATH`.
+Sem `uv`: `python3.12 -m venv .venv && source .venv/bin/activate && pip install -r requirements-dev.txt`.
+
+**Requisito:** [OpenSCAD](https://openscad.org/downloads.html) instalado. O servidor procura o binário em
+`OPENSCAD_PATH`, depois no `PATH` e depois nos locais conhecidos (Homebrew, `/Applications/OpenSCAD.app`...).
+No macOS: `brew install --cask openscad@snapshot`. Se ele estiver fora do `PATH`, aponte o caminho:
 
 ```bash
-# Verificar instalação
-openscad --version
+export OPENSCAD_PATH=/caminho/do/openscad   # opcional
+# Verificar instalação (no macOS a versão sai no stderr)
+"${OPENSCAD_PATH:-openscad}" --version
 ```
+
+No OpenSCAD 2021.01 sem display (SSH, container) os testes que dependem de PNG são pulados; rode sob
+`xvfb-run -a pytest` para executá-los.
 
 ## Rodando testes
 

@@ -3,9 +3,11 @@ Testes do MCP-OpenSCAD — v0.5.0
 Cobre: run_openscad, check_syntax, todos os geradores, validadores e handlers MCP.
 """
 import os
+import re
 import sys
 import math
 import struct
+import threading
 import pytest
 import subprocess
 import asyncio
@@ -569,7 +571,9 @@ async def test_handle_list_tools():
     # Análise
     assert "analyze_mesh" in tool_names
     assert "mesh_section" in tool_names
-    assert len(tools) == 26
+    # Exportação OBJ (nightly)
+    assert "export_obj" in tool_names
+    assert len(tools) == 27
 
     mesh_tool = next(t for t in tools if t.name == "analyze_mesh")
     props = mesh_tool.inputSchema["properties"]
@@ -590,7 +594,7 @@ async def test_handle_list_tools():
     assert "center" in sprops
     assert "timeout_s" in sprops
 
-    for export_tool in ("render_to_png", "export_stl", "export_3mf", "export_dxf", "export_svg"):
+    for export_tool in ("render_to_png", "export_stl", "export_3mf", "export_dxf", "export_svg", "export_obj"):
         t = next(t for t in tools if t.name == export_tool)
         assert "timeout_s" in t.inputSchema["properties"]
 
@@ -613,7 +617,41 @@ async def test_handle_call_tool_export_stl(tmp_path):
     assert os.path.exists(out_path)
 
 
+def _png_unavailable_reason():
+    """None se o OpenSCAD consegue gerar um PNG; senão o motivo. O 2021.01 sem display
+    (SSH, container, CI sem xvfb) morre por segfault ao criar o contexto OpenGL."""
+    try:
+        out_path, _ = asyncio.run(server.run_openscad("cube(1);", "png", ["--autocenter", "--viewall"]))
+    except RuntimeError as e:
+        if str(e).startswith("OpenSCAD Error"):
+            return "OpenSCAD sem contexto GL (2021.01 sem display)"
+        raise
+    os.remove(out_path)
+    return None
+
+
+@pytest.fixture(scope="session")
+def png_rendering():
+    """Pula os testes que dependem de PNG quando o OpenSCAD instalado não renderiza PNG aqui."""
+    reason = _png_unavailable_reason()
+    if reason:
+        pytest.skip(reason)
+
+
+def test_png_unavailable_reason_when_openscad_crashes(monkeypatch):
+    fake_exec, _ = _fake_openscad_process(-11, b"", b"")       # segfault e PNG de 0 bytes, como no 2021.01 sem display
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    assert _png_unavailable_reason() == "OpenSCAD sem contexto GL (2021.01 sem display)"
+
+
+def test_png_unavailable_reason_is_none_when_openscad_renders(monkeypatch):
+    fake_exec, _ = _fake_openscad_process(0, b"", b"\x89PNG fake")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    assert _png_unavailable_reason() is None
+
+
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("png_rendering")
 async def test_handle_call_tool_render_to_png():
     result = await server.handle_call_tool("render_to_png", {"scad_code": "sphere(r=5);"})
     assert len(result) == 2
@@ -816,6 +854,7 @@ async def test_generate_kerf_test_missing_args():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("png_rendering")
 async def test_openscad_renders_box():
     """Integração: gera SCAD de caixa e renderiza para PNG via OpenSCAD real."""
     cfg = {"width": 80, "depth": 60, "height": 40}
@@ -1908,6 +1947,7 @@ async def test_cnc_toolpath_hints_missing_config():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("png_rendering")
 async def test_render_to_png_default_camera():
     """Render com câmera padrão (autocenter + viewall)."""
     result = await server.handle_call_tool("render_to_png", {
@@ -1919,6 +1959,7 @@ async def test_render_to_png_default_camera():
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("png_rendering")
 async def test_render_to_png_custom_camera():
     """Render com câmera personalizada."""
     result = await server.handle_call_tool("render_to_png", {
@@ -1935,6 +1976,7 @@ async def test_render_to_png_custom_camera():
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("png_rendering")
 async def test_render_to_png_ortho_projection():
     """Render com projeção ortográfica."""
     result = await server.handle_call_tool("render_to_png", {
@@ -1946,6 +1988,7 @@ async def test_render_to_png_ortho_projection():
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("png_rendering")
 async def test_render_to_png_custom_size():
     """Render com tamanho de imagem personalizado."""
     result = await server.handle_call_tool("render_to_png", {
@@ -1974,7 +2017,7 @@ def test_verify_safety_guidelines_safe_nozzle():
 
 def test_validate_output_path_allowed():
     path = "/tmp/some_file.scad"
-    assert server.validate_output_path(path) == os.path.abspath(path)
+    assert server.validate_output_path(path) == os.path.realpath(path)
 
 def test_validate_output_path_denied():
     with pytest.raises(ValueError, match="Access denied"):
@@ -1983,7 +2026,7 @@ def test_validate_output_path_denied():
 def test_safe_output_path_sanitization():
     out_dir, proj = server.safe_output_path("/tmp/test_dir", "../../../etc/bad_project")
     assert proj == "bad_project"
-    assert out_dir == "/tmp/test_dir"
+    assert out_dir == os.path.realpath("/tmp/test_dir")
 
 def test_validate_config_parameters_negative_value():
     with pytest.raises(ValueError, match="must be strictly positive"):
@@ -2253,7 +2296,7 @@ def test_validate_output_path_uses_env_var(monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
         monkeypatch.setenv("MCP_OPENSCAD_ALLOWED_PATHS", tmpdir)
         result = server.validate_output_path(os.path.join(tmpdir, "test.scad"))
-        assert result.startswith(tmpdir)
+        assert result.startswith(os.path.realpath(tmpdir))
 
 
 def test_validate_output_path_env_var_blocks_outside(monkeypatch):
@@ -2500,7 +2543,10 @@ async def test_run_openscad_custom_timeout_used():
     mock_proc = MagicMock()
     mock_proc.communicate = AsyncMock(return_value=(b"", b""))
 
-    async def mock_create_subprocess(*a, **kw):
+    async def mock_create_subprocess(*cmd, **kw):
+        # saída ausente ou vazia é falha: o processo falso precisa "gerar" o arquivo (-o)
+        with open(cmd[list(cmd).index("-o") + 1], "wb") as f:
+            f.write(b"solid x\nendsolid x\n")
         return mock_proc
 
     captured = {}
@@ -3006,3 +3052,982 @@ async def test_handle_call_tool_mesh_section_from_scad_code():
     assert "Corte de Malha" in ret[0].text
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — Descoberta do binário do OpenSCAD (find_openscad)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def no_openscad_cache():
+    """find_openscad() é cacheada: limpa antes e depois dos testes que simulam a busca."""
+    server.find_openscad.cache_clear()
+    yield
+    server.find_openscad.cache_clear()
+
+
+def _fake_executable(path):
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_find_openscad_env_has_precedence(tmp_path, monkeypatch, no_openscad_cache):
+    fake = _fake_executable(tmp_path / "my-openscad")
+    monkeypatch.setenv("OPENSCAD_PATH", fake)
+    monkeypatch.setattr(server.shutil, "which", lambda name: "/usr/bin/openscad-from-path")
+    assert server.find_openscad() == fake
+
+
+def test_find_openscad_env_ignored_when_not_executable(tmp_path, monkeypatch, no_openscad_cache):
+    not_exec = tmp_path / "not-executable"
+    not_exec.write_text("x")
+    not_exec.chmod(0o644)
+    monkeypatch.setenv("OPENSCAD_PATH", str(not_exec))
+    monkeypatch.setattr(server.shutil, "which", lambda name: "/usr/bin/openscad-from-path")
+    assert server.find_openscad() == "/usr/bin/openscad-from-path"
+
+
+def test_find_openscad_uses_path_lookup(monkeypatch, no_openscad_cache):
+    monkeypatch.delenv("OPENSCAD_PATH", raising=False)
+    monkeypatch.setattr(server.shutil, "which", lambda name: "/opt/x/openscad" if name == "openscad" else None)
+    assert server.find_openscad() == "/opt/x/openscad"
+
+
+def test_find_openscad_falls_back_to_known_macos_locations(monkeypatch, no_openscad_cache):
+    app = "/Applications/OpenSCAD.app/Contents/MacOS/OpenSCAD"
+    monkeypatch.delenv("OPENSCAD_PATH", raising=False)
+    with monkeypatch.context() as m:
+        m.setattr(server.shutil, "which", lambda name: None)
+        m.setattr(server.os.path, "isfile", lambda p: p == app)
+        m.setattr(server.os, "access", lambda p, mode: p == app)
+        assert server.find_openscad() == app
+
+
+def test_find_openscad_result_is_cached(monkeypatch, no_openscad_cache):
+    calls = []
+    monkeypatch.delenv("OPENSCAD_PATH", raising=False)
+    monkeypatch.setattr(server.shutil, "which", lambda name: calls.append(name) or "/opt/x/openscad")
+    assert server.find_openscad() == server.find_openscad()
+    assert len(calls) == 1
+
+
+def _hide_openscad(m):
+    """Faz a busca não achar nada (PATH, OPENSCAD_PATH e lista fixa)."""
+    m.delenv("OPENSCAD_PATH", raising=False)
+    m.setattr(server.shutil, "which", lambda name: None)
+    m.setattr(server.os.path, "isfile", lambda p: False)
+
+
+def test_find_openscad_error_names_the_rejected_openscad_path(monkeypatch, no_openscad_cache):
+    with monkeypatch.context() as m:
+        _hide_openscad(m)
+        m.setenv("OPENSCAD_PATH", "/wrong/place/openscad")
+        with pytest.raises(RuntimeError) as exc:
+            server.find_openscad()
+    assert "/wrong/place/openscad" in str(exc.value)
+    assert "OpenSCAD não encontrado" in str(exc.value)
+
+
+def test_find_openscad_error_does_not_blame_an_unset_openscad_path(monkeypatch, no_openscad_cache):
+    with monkeypatch.context() as m:
+        _hide_openscad(m)
+        with pytest.raises(RuntimeError) as exc:
+            server.find_openscad()
+    assert "foi ignorado" not in str(exc.value)
+
+
+def test_find_openscad_not_found_has_actionable_message(monkeypatch, no_openscad_cache):
+    with monkeypatch.context() as m:
+        _hide_openscad(m)
+        with pytest.raises(RuntimeError) as exc:
+            server.find_openscad()
+    msg = str(exc.value)
+    assert "OpenSCAD não encontrado" in msg
+    assert "OPENSCAD_PATH" in msg
+    assert "openscad@snapshot" in msg
+
+
+@pytest.mark.asyncio
+async def test_check_syntax_without_openscad_returns_false_instead_of_raising(monkeypatch, no_openscad_cache):
+    with monkeypatch.context() as m:
+        _hide_openscad(m)
+        is_valid, msg = await server.check_scad_syntax("cube(1);")
+    assert is_valid is False
+    assert "OpenSCAD não encontrado" in msg
+
+
+@pytest.mark.asyncio
+async def test_run_openscad_without_openscad_raises_actionable_error(monkeypatch, no_openscad_cache):
+    with monkeypatch.context() as m:
+        _hide_openscad(m)
+        with pytest.raises(RuntimeError, match="OpenSCAD não encontrado"):
+            await server.run_openscad("cube(1);", "stl")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — validate_output_path (realpath, commonpath, tempdir do sistema)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_validate_output_path_denies_sibling_prefix(tmp_path, monkeypatch):
+    allowed = tmp_path / "ok"
+    evil = tmp_path / "okevil"
+    allowed.mkdir()
+    evil.mkdir()
+    monkeypatch.setenv("MCP_OPENSCAD_ALLOWED_PATHS", str(allowed))
+    with pytest.raises(ValueError, match="Access denied"):
+        server.validate_output_path(str(evil / "x.stl"))
+    assert server.validate_output_path(str(allowed / "x.stl")) == os.path.realpath(str(allowed / "x.stl"))
+
+
+def test_validate_output_path_denies_tmp_sibling_with_default_list(monkeypatch):
+    monkeypatch.delenv("MCP_OPENSCAD_ALLOWED_PATHS", raising=False)
+    with pytest.raises(ValueError, match="Access denied"):
+        server.validate_output_path("/tmpevil/x.stl")
+
+
+def test_validate_output_path_denies_symlink_escape(tmp_path, monkeypatch):
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "outside"
+    allowed.mkdir()
+    outside.mkdir()
+    (allowed / "link").symlink_to(outside)
+    monkeypatch.setenv("MCP_OPENSCAD_ALLOWED_PATHS", str(allowed))
+    with pytest.raises(ValueError, match="Access denied"):
+        server.validate_output_path(str(allowed / "link" / "x.stl"))
+
+
+def test_validate_output_path_allows_system_tempdir(monkeypatch):
+    """macOS: tempfile.gettempdir() é /var/folders/... (fora de ~, /tmp e /var/tmp)."""
+    monkeypatch.delenv("MCP_OPENSCAD_ALLOWED_PATHS", raising=False)
+    monkeypatch.setattr(server.tempfile, "gettempdir", lambda: "/macos-sim/var/folders/xx/T")
+    path = "/macos-sim/var/folders/xx/T/out.stl"
+    assert server.validate_output_path(path) == os.path.realpath(path)
+
+
+def test_validate_output_path_allows_symlinked_prefix(tmp_path, monkeypatch):
+    """macOS: /tmp é um symlink para /private/tmp; o chamador pode passar qualquer um dos dois."""
+    real = tmp_path / "private_tmp"
+    link = tmp_path / "tmp"
+    real.mkdir()
+    link.symlink_to(real)
+    monkeypatch.setenv("MCP_OPENSCAD_ALLOWED_PATHS", str(link))
+    for target in (real / "x.stl", link / "x.stl"):
+        assert server.validate_output_path(str(target)) == os.path.realpath(str(target))
+
+
+def test_validate_output_path_env_uses_os_pathsep(tmp_path, monkeypatch):
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    monkeypatch.setenv("MCP_OPENSCAD_ALLOWED_PATHS", os.pathsep.join([str(a), str(b)]))
+    assert server.validate_output_path(str(b / "x.stl")) == os.path.realpath(str(b / "x.stl"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — B3: run_openscad não aceita saída vazia nem returncode != 0
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fake_openscad_process(returncode, stderr=b"", output=None):
+    """Substitui asyncio.create_subprocess_exec: cria o arquivo de saída (-o) com
+    `output` (se não for None) e devolve um processo falso com `returncode`."""
+    created = {}
+
+    async def fake_exec(*cmd, **kwargs):
+        out_path = cmd[list(cmd).index("-o") + 1]
+        created["out_path"] = out_path
+        if output is not None:
+            with open(out_path, "wb") as f:
+                f.write(output)
+        proc = MagicMock()
+        proc.returncode = returncode
+        proc.communicate = AsyncMock(return_value=(b"", stderr))
+        return proc
+
+    return fake_exec, created
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returncode, output", [(139, b""), (0, b""), (1, b"partial")])
+async def test_run_openscad_fails_on_bad_exit_or_empty_output(monkeypatch, returncode, output):
+    fake_exec, created = _fake_openscad_process(returncode, b"Can't create OpenGL OffscreenView", output)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    with pytest.raises(RuntimeError, match="OpenSCAD Error"):
+        await server.run_openscad("cube(1);", "png")
+    assert not os.path.exists(created["out_path"])
+
+
+@pytest.mark.asyncio
+async def test_render_to_png_reports_error_instead_of_empty_image(monkeypatch):
+    fake_exec, _ = _fake_openscad_process(139, b"Can't create OpenGL OffscreenView", b"")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    result = await server.handle_call_tool("render_to_png", {"scad_code": "cube(1);"})
+    assert [c.type for c in result] == ["text"]
+    assert "OpenSCAD Error" in result[0].text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — B1: juntas do lado direito usam a borda da PEÇA, não o length do loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SQUARE_RE = re.compile(
+    r"translate\(\[\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\]\)\s*square\(\[\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\]\)"
+)
+
+
+def _scad_module_body(scad, name):
+    m = re.search(rf"module {name}\(\)\s*\{{(.*?)^\}}", scad, re.S | re.M)
+    assert m, f"module {name} not found"
+    return m.group(1)
+
+
+def _joint_x_positions(scad, module, width):
+    """Posições X dos retângulos de largura `width` (fendas = slot, dentes = t) no módulo."""
+    body = _scad_module_body(scad, module)
+    return sorted({float(x) for x, _y, w, _h in _SQUARE_RE.findall(body) if abs(float(w) - width) < 1e-6})
+
+
+@pytest.mark.parametrize("W, D, H", [(150, 100, 60), (80, 120, 200)])
+def test_box_right_joints_use_the_piece_edge(W, D, H):
+    t, kerf = 3, 0.2
+    slot = t - kerf
+    scad = server.generate_box_scad({
+        "width": W, "depth": D, "height": H, "material_thickness": t, "kerf": kerf, "lid_type": "none",
+    })
+    assert _joint_x_positions(scad, "box_front_wall", slot) == [0.0, round(W - slot, 3)]
+    assert _joint_x_positions(scad, "box_floor", slot) == [0.0, round(W - slot, 3)]
+    assert _joint_x_positions(scad, "box_side_wall", t) == [-float(t), float(D - 2 * t)]
+
+
+@pytest.mark.parametrize("W, D, H", [(150, 100, 60), (80, 120, 200)])
+def test_laser_part_right_joints_use_the_piece_edge(W, D, H):
+    t, kerf = 3, 0.2
+    slot = t - kerf
+    side_w = D - 2 * t
+    scad = server.generate_laser_scad({
+        "width": W, "depth": D, "height": H, "material_thickness": t, "kerf": kerf,
+    })
+    assert _joint_x_positions(scad, "front_wall", slot) == [0.0, round(W - slot, 3)]
+    assert _joint_x_positions(scad, "back_wall", slot) == [0.0, round(W - slot, 3)]
+    assert _joint_x_positions(scad, "side_wall", t) == [-float(t), float(side_w)]
+
+
+@pytest.mark.parametrize("W, D, H", [(150, 100, 60), (80, 120, 200)])
+def test_laser_part_floor_has_side_slots_on_both_edges(W, D, H):
+    t, kerf = 3, 0.2
+    slot = t - kerf
+    scad = server.generate_laser_scad({
+        "width": W, "depth": D, "height": H, "material_thickness": t, "kerf": kerf,
+    })
+    assert _joint_x_positions(scad, "floor_base", slot) == [0.0, round(W - slot, 3)]
+
+
+def _floor_side_slots_y(scad, floor_module, slot):
+    """{x: [(y0, y1), ...]}: fendas laterais do piso (largura = slot), agrupadas pela borda em que ficam."""
+    by_x = {}
+    for x, y, w, h in _SQUARE_RE.findall(_scad_module_body(scad, floor_module)):
+        if abs(float(w) - slot) < 1e-6:
+            by_x.setdefault(float(x), []).append((float(y), round(float(y) + float(h), 4)))
+    return {x: sorted(v) for x, v in by_x.items()}
+
+
+def _side_wall_bottom_teeth(scad, wall_module, t):
+    """[(u0, u1), ...]: dentes da borda inferior da lateral (y = -t, altura t), ao longo da peça."""
+    return sorted(
+        (float(x), round(float(x) + float(w), 4))
+        for x, y, w, h in _SQUARE_RE.findall(_scad_module_body(scad, wall_module))
+        if abs(float(y) + t) < 1e-6 and abs(float(h) - t) < 1e-6
+    )
+
+
+@pytest.mark.parametrize("W, D, H", [(150, 100, 60), (80, 120, 200)])
+def test_laser_part_floor_side_slots_line_up_with_side_wall_teeth(W, D, H):
+    """A lateral fica entre a frontal e a traseira: no assembly seu comprimento começa em y = t. As fendas
+    laterais do piso saíam de y = 0, 3 mm antes dos dentes da lateral (0 a 18,9 contra 3 a 21,9)."""
+    t, kerf = 3, 0.2
+    slot = t - kerf
+    scad = server.generate_laser_scad({
+        "width": W, "depth": D, "height": H, "material_thickness": t, "kerf": kerf,
+    })
+    assert re.search(
+        r"translate\(\[0,\s*t,\s*0\]\)\s*rotate\(\[90,\s*0,\s*90\]\)\s*linear_extrude\(t\)\s*side_wall\(\)", scad
+    ), "o assembly deixou de começar a lateral em y = t: revise este teste"
+    teeth_in_floor_frame = [(round(a + t, 4), round(b + t, 4)) for a, b in _side_wall_bottom_teeth(scad, "side_wall", t)]
+    slots = _floor_side_slots_y(scad, "floor_base", slot)
+    assert slots[0.0] == teeth_in_floor_frame
+    assert slots[round(W - slot, 3)] == teeth_in_floor_frame
+
+
+def test_laser_part_floor_side_slots_exact_positions_for_the_readme_size():
+    scad = server.generate_laser_scad({
+        "width": 150, "depth": 100, "height": 60, "material_thickness": 3, "kerf": 0.2,
+    })
+    expected = [(3.0, 21.9), (40.5, 59.5), (78.1, 97.0)]
+    assert _floor_side_slots_y(scad, "floor_base", 2.8) == {0.0: expected, 147.2: expected}
+
+
+@pytest.mark.asyncio
+async def test_laser_part_side_wall_teeth_fit_the_floor_slots():
+    """Geometria real: monta o piso e as duas laterais como no assembly_3d e mede a interferência. Com os dentes
+    dentro das fendas só sobra a folga de projeto (t - slot = kerf) ao longo dos dentes; com a fenda 3 mm
+    fora de lugar os dentes batiam no piso (110 mm³ por lateral em vez de 34)."""
+    t, kerf = 3, 0.2
+    scad = server.generate_laser_scad({"width": 150, "depth": 100, "height": 60, "material_thickness": t, "kerf": kerf})
+    tooth_length = sum(b - a for a, b in _side_wall_bottom_teeth(scad, "side_wall", t))
+    designed = 2 * (kerf * t * tooth_length)        # 0,2 mm de folga x 3 mm de altura x comprimento dos dentes, nas 2 laterais
+    assert await _interference_mm3(scad, "floor", ["left", "right"]) == pytest.approx(designed, abs=0.1)
+
+
+def test_laser_part_floor_front_slots_line_up_with_front_wall_teeth():
+    """Na frente não há deslocamento: o piso e a parede frontal usam o mesmo referencial em X."""
+    t, kerf = 3, 0.2
+    slot = t - kerf
+    scad = server.generate_laser_scad({"width": 150, "depth": 100, "height": 60, "material_thickness": t, "kerf": kerf})
+    wall_teeth = _side_wall_bottom_teeth(scad, "front_wall", t)
+    floor_slots = sorted(
+        (float(x), round(float(x) + float(w), 4))
+        for x, y, w, h in _SQUARE_RE.findall(_scad_module_body(scad, "floor_base"))
+        if float(y) == 0.0 and abs(float(h) - slot) < 1e-6
+    )
+    assert wall_teeth
+    assert floor_slots == wall_teeth
+
+
+BOX_CFG = {"width": 150, "depth": 100, "height": 60, "material_thickness": 3, "kerf": 0.2, "lid_type": "none"}
+
+
+def test_box_floor_side_slots_line_up_with_side_wall_teeth():
+    """Mesmo modelo do generate_laser_part: a lateral cabe entre a frontal e a traseira (começa em y = t) e as
+    fendas laterais do piso usam os mesmos dedos dos dentes inferiores da lateral, deslocados em t."""
+    t, kerf = 3, 0.2
+    slot = t - kerf
+    scad = server.generate_box_scad(BOX_CFG)
+    assert re.search(
+        r"translate\(\[0,\s*t,\s*0\]\)\s*rotate\(\[90,\s*0,\s*90\]\)\s*linear_extrude\(t\)\s*box_side_wall\(\)", scad
+    ), "o assembly deixou de começar a lateral em y = t: revise este teste"
+    teeth_in_floor_frame = [(round(a + t, 4), round(b + t, 4)) for a, b in _side_wall_bottom_teeth(scad, "box_side_wall", t)]
+    slots = _floor_side_slots_y(scad, "box_floor", slot)
+    assert slots[0.0] == teeth_in_floor_frame
+    assert slots[round(150 - slot, 3)] == teeth_in_floor_frame
+
+
+def test_box_floor_side_slots_exact_positions_for_the_readme_size():
+    """Antes: fendas do piso em Y 20,1-39,9 e 60,1-79,9 (dedos ímpares); dentes da lateral (comprimento 100) em
+    0-19,9, 40,1-59,9 e 80,1-100 (dedos pares). Agora a lateral tem 94 e as duas listas são a mesma."""
+    scad = server.generate_box_scad(BOX_CFG)
+    expected = [(3.0, 21.7), (40.7, 59.3), (78.3, 97.0)]
+    assert _floor_side_slots_y(scad, "box_floor", 2.8) == {0.0: expected, 147.2: expected}
+    assert _side_wall_bottom_teeth(scad, "box_side_wall", 3) == [(0.0, 18.7), (37.7, 56.3), (75.3, 94.0)]
+
+
+def test_box_side_walls_fit_between_front_and_back_in_layout():
+    scad = server.generate_box_scad(BOX_CFG)
+    sides = [(w, h) for _x, _y, w, h in _box_layout_rects(scad) if (w, h) == (94.0, 60.0)]
+    assert len(sides) == 2                       # D - 2t = 94, não 100
+
+
+def test_estimate_material_use_lateral_fits_between_front_and_back():
+    r = server.estimate_material_use({"width": 150, "depth": 100, "height": 60, "material_thickness": 3})
+    lateral = next(p for p in r["pieces"] if p["name"] == "Lateral")
+    assert (lateral["w"], lateral["h"], lateral["qty"]) == (94, 60, 2)
+
+
+_ASSEMBLY_PART_RE = re.compile(r"color\(\[[^\]]*\]\)\s*(.*?linear_extrude\(t\)\s*\w+\(\))\s*;", re.S)
+
+
+def _assembly_parts(scad):
+    """Expressões de posicionamento do assembly_3d: piso, frontal, traseira, lateral esquerda e direita."""
+    exprs = _ASSEMBLY_PART_RE.findall(_scad_module_body(scad, "assembly_3d"))
+    assert len(exprs) == 5
+    return dict(zip(("floor", "front", "back", "left", "right"), exprs))
+
+
+async def _interference_mm3(scad, part, others):
+    """Volume (mm³) da interseção de `part` com a união de `others`, na posição do assembly_3d."""
+    parts = _assembly_parts(scad)
+    union_body = "".join(f"        {parts[o]};\n" for o in others)
+    scene = f"\nintersection() {{\n    {parts[part]};\n    union() {{\n{union_body}    }}\n}}\n"
+    stl_path, _ = await server.run_openscad(scad[:scad.index('RENDER_MODE = "3d";')] + scene, "stl")
+    try:
+        return server.analyze_mesh(stl_path)["volume_mm3"]
+    finally:
+        os.remove(stl_path)
+
+
+def _clearance_lengths(scad, t):
+    """Comprimentos que geram a folga de projeto (t - slot = kerf) em cada tipo de junta do generate_box."""
+    return {
+        "side_bottom": sum(b - a for a, b in _side_wall_bottom_teeth(scad, "box_side_wall", t)),
+        "front_bottom": sum(b - a for a, b in _side_wall_bottom_teeth(scad, "box_front_wall", t)),
+        "side_tabs": sum(
+            float(h) for x, _y, _w, h in _SQUARE_RE.findall(_scad_module_body(scad, "box_side_wall")) if float(x) == -t
+        ),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("part, other, joint", [
+    ("floor", "left", "side_bottom"), ("floor", "right", "side_bottom"),
+    ("floor", "front", "front_bottom"), ("floor", "back", "front_bottom"),
+    ("front", "left", "side_tabs"), ("front", "right", "side_tabs"),
+    ("back", "left", "side_tabs"), ("back", "right", "side_tabs"),
+])
+async def test_box_pieces_only_interfere_by_the_designed_clearance(part, other, joint):
+    """Geometria real: monta as peças como no assembly_3d e mede a interferência de cada par que se encaixa.
+    Com dentes dentro das fendas só sobra a folga de projeto (t - slot = kerf) x altura do dente x comprimento."""
+    t, kerf = 3, 0.2
+    scad = server.generate_box_scad(BOX_CFG)
+    designed = kerf * t * _clearance_lengths(scad, t)[joint]
+    assert await _interference_mm3(scad, part, [other]) == pytest.approx(designed, abs=0.1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — B1b/B1c: divisórias do generate_box no layout 2D
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LAYOUT_ITEM_RE = re.compile(
+    r"translate\(\[\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\]\)\s*(box_\w+\(\)|square\(\[\s*[\d.]+\s*,\s*[\d.]+\s*\]\))\s*;"
+)
+
+
+def _scad_numbers(scad):
+    """Variáveis numéricas do cabeçalho do SCAD gerado (t, W, D, H, slot, side_d...), avaliadas em ordem."""
+    env = {}
+    for name, expr in re.findall(r"^(\w+)\s*=\s*([^;\"]+);", scad.split("module ", 1)[0], re.M):
+        try:
+            env[name] = eval(expr, {"__builtins__": {}}, env)
+        except Exception:
+            pass
+    return env
+
+
+def _body_size(scad, module):
+    """(largura, altura) do retângulo principal de um módulo: o primeiro square(), avaliado com o cabeçalho."""
+    m = re.search(r"square\(\[\s*([^,\]]+?)\s*,\s*([^\]]+?)\s*\]\)", _scad_module_body(scad, module))
+    env = _scad_numbers(scad)
+    return float(eval(m.group(1), {"__builtins__": {}}, env)), float(eval(m.group(2), {"__builtins__": {}}, env))
+
+
+def _box_lid_size(scad):
+    """(w, d) do retângulo principal da tampa (snap: W×D; slide: menor pela folga)."""
+    m = re.search(r"square\(\[\s*([\d.]+)\s*,\s*([\d.]+)\s*\]\)", _scad_module_body(scad, "box_lid"))
+    return float(m.group(1)), float(m.group(2))
+
+
+def _box_layout_rects(scad):
+    """Retângulos (x, y, w, h) das peças em layout_2d, sem os dentes. Os tamanhos vêm dos módulos gerados."""
+    sizes = {
+        "box_floor()": _body_size(scad, "box_floor"),
+        "box_front_wall()": _body_size(scad, "box_front_wall"),
+        "box_side_wall()": _body_size(scad, "box_side_wall"),
+    }
+    if "module box_lid()" in scad:
+        sizes["box_lid()"] = _box_lid_size(scad)
+    rects = []
+    for x, y, what in _LAYOUT_ITEM_RE.findall(_scad_module_body(scad, "layout_2d")):
+        if what in sizes:
+            w, h = sizes[what]
+        else:
+            w, h = (float(v) for v in re.findall(r"[\d.]+", what))
+        rects.append((float(x), float(y), float(w), float(h)))
+    return rects
+
+
+def _overlapping_pairs(rects):
+    return [
+        (a, b)
+        for i, a in enumerate(rects)
+        for b in rects[i + 1:]
+        if a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
+    ]
+
+
+def test_box_dividers_do_not_overlap_other_pieces_in_layout():
+    scad = server.generate_box_scad({
+        "width": 150, "depth": 100, "height": 60, "material_thickness": 3, "kerf": 0.2,
+        "lid_type": "none", "dividers_x": 2, "dividers_y": 1,
+    })
+    rects = _box_layout_rects(scad)
+    assert len(rects) == 5 + 3
+    assert _overlapping_pairs(rects) == []
+
+
+@pytest.mark.parametrize("dx, dy", [(0, 0), (2, 0), (0, 2), (1, 1), (3, 2)])
+def test_box_layout_has_one_piece_per_divider(dx, dy):
+    scad = server.generate_box_scad({
+        "width": 150, "depth": 100, "height": 60, "material_thickness": 3, "kerf": 0.2,
+        "lid_type": "none", "dividers_x": dx, "dividers_y": dy,
+    })
+    rects = _box_layout_rects(scad)
+    sizes = [(w, h) for _x, _y, w, h in rects]
+    assert len(rects) == 5 + dx + dy
+    assert sizes.count((94.0, 60.0)) == 2 + dx    # 2 laterais + divisórias X: todas inner_d x H
+    assert sizes.count((144.0, 60.0)) == dy    # divisória Y: inner_w x H
+    assert _overlapping_pairs(rects) == []
+
+
+@pytest.mark.parametrize("lid", ["snap", "slide"])
+@pytest.mark.parametrize("W, D, H", [(150, 100, 60), (80, 40, 100)])
+def test_box_lid_does_not_overlap_the_floor_in_layout(lid, W, D, H):
+    """A tampa ia para y = H + gap: sobrepunha o piso (0..D) sempre que D > H + gap."""
+    scad = server.generate_box_scad({
+        "width": W, "depth": D, "height": H, "material_thickness": 3, "kerf": 0.2, "lid_type": lid,
+    })
+    rects = _box_layout_rects(scad)
+    assert len(rects) == 5 + 1
+    assert _overlapping_pairs(rects) == []
+
+
+def test_box_layout_with_lid_and_dividers_has_no_overlap():
+    scad = server.generate_box_scad({
+        "width": 150, "depth": 100, "height": 60, "lid_type": "snap", "dividers_x": 2, "dividers_y": 1,
+    })
+    rects = _box_layout_rects(scad)
+    assert len(rects) == 5 + 3 + 1
+    assert _overlapping_pairs(rects) == []
+
+
+@pytest.mark.asyncio
+async def test_box_layout_svg_keeps_one_contour_per_piece():
+    """Exemplo do README: 5 peças + 2 divisórias + tampa + 2 furos de fenda no piso = 10 contornos.
+    Com a tampa fundida no piso o SVG saía com 9."""
+    scad = server.generate_box_scad({
+        "width": 150, "depth": 100, "height": 60, "material_thickness": 3, "kerf": 0.2,
+        "fingers": 7, "lid_type": "snap", "dividers_x": 2,
+    }).replace('RENDER_MODE = "3d"', 'RENDER_MODE = "2d"')
+    svg_path, _ = await server.run_openscad(scad, "svg")
+    try:
+        with open(svg_path, encoding="utf-8") as f:
+            path_data = " ".join(re.findall(r'\bd="([^"]*)"', f.read()))
+    finally:
+        os.remove(svg_path)
+    assert path_data.count("M") == 10
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — B5: `variables` (-D) validadas e escapadas
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _stl_bbox(path):
+    tris = server._parse_stl(path)
+    pts = [v for tri in tris for v in tri]
+    return [(min(p[i] for p in pts), max(p[i] for p in pts)) for i in range(3)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool, ext", [("export_stl", "stl"), ("render_to_png", "png")])
+async def test_variables_key_with_statements_is_rejected(tmp_path, tool, ext):
+    args = {"scad_code": "cube(1);", "variables": {"a=1;translate([50,0,0]) cube(5);b": 1}}
+    if tool != "render_to_png":
+        args["output_path"] = str(tmp_path / f"o.{ext}")
+    with pytest.raises(ValueError, match="variable name"):
+        await server.handle_call_tool(tool, args)
+
+
+@pytest.mark.asyncio
+async def test_variables_key_with_statements_is_rejected_in_analyze_mesh():
+    # analyze_mesh devolve os erros como texto (❌ ...) em vez de levantar
+    result = await server.handle_call_tool("analyze_mesh", {
+        "scad_code": "cube(1);", "variables": {"a=1;cube(5);b": 1},
+    })
+    assert "Invalid variable name" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_variables_string_value_cannot_break_out_of_the_string(tmp_path):
+    out = tmp_path / "o.stl"
+    result = await server.handle_call_tool("export_stl", {
+        "scad_code": "cube(1);",
+        "output_path": str(out),
+        "variables": {"s": '\\"; translate([50,0,0]) cube(5); //'},
+    })
+    assert "Exported successfully" in result[0].text
+    (x_min, x_max), _, _ = _stl_bbox(str(out))
+    assert x_max == pytest.approx(1.0)       # só o cubo base: a injeção não adicionou geometria
+
+
+@pytest.mark.asyncio
+async def test_variables_string_backslash_is_escaped(tmp_path):
+    out = tmp_path / "o.stl"
+    await server.handle_call_tool("export_stl", {
+        "scad_code": "cube(len(s));",
+        "output_path": str(out),
+        "variables": {"s": "a\\nb"},          # a, barra, n, b = 4 caracteres
+    })
+    (_, x_max), _, _ = _stl_bbox(str(out))
+    assert x_max == pytest.approx(4.0)
+
+
+@pytest.mark.parametrize("value", [{"x": 1}, None, [1, "a"], [[1, 2], [3, 4]], object()])
+def test_variables_rejects_unsupported_value_types(value):
+    with pytest.raises(ValueError, match="variable"):
+        server._define_args({"v": value})
+
+
+def test_variables_accepts_scalars_numeric_lists_and_special_names():
+    args = server._define_args({"$fn": 32, "w": 2.5, "flag": True, "off": False, "name": 'a"b', "dims": [1, 2.5, 3]})
+    assert args == [
+        "-D", "$fn=32",
+        "-D", "w=2.5",
+        "-D", "flag=true",
+        "-D", "off=false",
+        "-D", 'name="a\\"b"',
+        "-D", "dims=[1, 2.5, 3]",
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — B6: filtro de import()/surface() não é contornável por comentário ou nome legado
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("code", [
+    'import/**/("x.stl");',
+    'import_stl("x.stl");',
+    'import_off("x.off");',
+    'import_dxf("x.dxf");',
+    'surface/**/(file="x.dat");',
+    'import // comentário\n("x.stl");',
+    's = "//"; import("x.stl");',        # "//" dentro de string não é comentário
+    's = "/*"; import("x.stl"); t = "*/";',
+])
+def test_safety_blocks_obfuscated_file_reading(code):
+    with pytest.raises(ValueError, match="Safety violation"):
+        server.verify_safety_guidelines(code)
+
+
+def test_safety_ignores_import_mentioned_only_in_comments():
+    server.verify_safety_guidelines('cube(1); // import("x.stl") não é usado\n/* surface(file="y") */')
+
+
+def test_safety_does_not_block_identifiers_that_merely_contain_import():
+    server.verify_safety_guidelines("module my_import(x) { cube(x); } my_import(2); important = 3;")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — B16: palavras banidas casam por palavra, não por substring
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("code", ["begun = 1;", "gunmetal = 1;", "gun2 = 1;", "module bombay() {}"])
+def test_banned_words_do_not_match_inside_other_words(code):
+    server.verify_safety_guidelines(code)
+    server.verify_safety_guidelines("cube(1);", project_name=code)
+
+
+@pytest.mark.parametrize("code", [
+    "cube(1); // gun", "GUN();", "a gun model", "guns = 2;", "bomb()", "pistol (grip)",
+    "rocket body", "rocket_body = 1;", "combustion chamber", "trigger();",
+    "water_gun_prop = 1;", "pistol_grip();", "module gun_barrel() {}", "ar15_receiver = 1;", "x_bomb_y = 1;",
+])
+def test_banned_words_still_block_whole_words(code):
+    with pytest.raises(ValueError, match="Safety violation"):
+        server.verify_safety_guidelines(code)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — openings do generate_laser_part: só front/back são desenhadas
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RECT_OPENING = {"shape": "rect", "x": 10, "y": 10, "w": 20, "h": 20}
+
+
+@pytest.mark.parametrize("wall", ["left", "right"])
+def test_laser_part_rejects_openings_on_left_and_right_walls(wall):
+    with pytest.raises(ValueError, match="front/back"):
+        server.validate_config_parameters("generate_laser_part", {"openings": [{"wall": wall, **_RECT_OPENING}]})
+
+
+@pytest.mark.asyncio
+async def test_generate_laser_part_handler_rejects_left_opening(tmp_path):
+    with pytest.raises(ValueError, match="front/back"):
+        await server.handle_call_tool("generate_laser_part", {
+            "config": {"width": 100, "depth": 80, "height": 50, "openings": [{"wall": "left", **_RECT_OPENING}]},
+            "output_dir": str(tmp_path), "project_name": "p",
+        })
+
+
+@pytest.mark.parametrize("wall", ["front", "back"])
+def test_laser_part_still_accepts_openings_on_front_and_back(wall):
+    server.validate_config_parameters("generate_laser_part", {"openings": [{"wall": wall, **_RECT_OPENING}]})
+
+
+def test_validate_laser_config_warns_about_openings_that_will_be_ignored():
+    warns = server.validate_config({
+        "width": 100, "depth": 80, "height": 50, "openings": [{"wall": "right", **_RECT_OPENING}],
+    })
+    assert any("front/back" in w for w in warns)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — B8: escrita só onde a tool promete
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_name", ["../../x", "/abs/x", "a/b", "a\\b"])
+async def test_generate_assembly_rejects_piece_names_with_path_separators(tmp_path, bad_name):
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="piece name"):
+        await server.handle_call_tool("generate_assembly", {
+            "config": {"pieces": [{"name": bad_name, "w": 10, "d": 10, "h": 10}]},
+            "output_dir": str(out), "project_name": "asm",
+        })
+    assert not (tmp_path / "x.scad").exists()
+    assert not (out / "pieces").exists() or list((out / "pieces").glob("*")) == []
+
+
+@pytest.mark.asyncio
+async def test_generate_assembly_sanitizes_piece_names(tmp_path):
+    """Espaço, ponto e acento viram '_' (ou somem): o módulo SCAD e o arquivo precisam ser válidos."""
+    out = tmp_path / "out"
+    result = await server.handle_call_tool("generate_assembly", {
+        "config": {"pieces": [
+            {"name": "peça 1.b", "w": 10, "d": 10, "h": 10},
+            {"name": "wall front", "w": 10, "d": 10, "h": 10, "translate": [20, 0, 0]},
+            {"name": "ok-name_2", "w": 10, "d": 10, "h": 10, "translate": [40, 0, 0]},
+        ]},
+        "output_dir": str(out), "project_name": "asm",
+    })
+    assert "Erro STL" not in result[0].text           # SCAD válido: o STL do assembly foi gerado
+    assert (out / "asm.stl").is_file()
+    for filename in ("peca_1_b.scad", "wall_front.scad", "ok-name_2.scad"):
+        assert (out / "pieces" / filename).is_file()
+    assembly = (out / "asm.scad").read_text(encoding="utf-8")
+    assert "module piece_peca_1_b()" in assembly
+    assert "module piece_ok_name_2()" in assembly
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool, wrong", [
+    ("export_stl", "out.txt"), ("export_3mf", "out.stl"), ("export_dxf", "out.svg"), ("export_svg", "out"),
+])
+async def test_export_requires_the_extension_of_the_tool(tmp_path, tool, wrong):
+    with pytest.raises(ValueError, match="extension"):
+        await server.handle_call_tool(tool, {"scad_code": "square(5);", "output_path": str(tmp_path / wrong)})
+    assert not (tmp_path / wrong).exists()
+
+
+@pytest.mark.asyncio
+async def test_export_extension_check_is_case_insensitive(tmp_path):
+    out = tmp_path / "OUT.STL"
+    result = await server.handle_call_tool("export_stl", {"scad_code": "cube(1);", "output_path": str(out)})
+    assert "Exported successfully" in result[0].text
+    assert out.is_file()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — B4: check_syntax decide por returncode e linhas ERROR:, não por substring
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_check_syntax_echo_containing_the_word_error_is_valid():
+    is_valid, msg = await server.check_scad_syntax('echo("no error here"); cube(5);')
+    assert is_valid is True
+    assert "ECHO" in msg
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["cube(5);", "square(5);", "// só um comentário", "foo_unknown_module();"])
+async def test_check_syntax_accepts_2d_3d_empty_and_unknown_module(code):
+    is_valid, msg = await server.check_scad_syntax(code)
+    assert is_valid is True, msg
+
+
+@pytest.mark.asyncio
+async def test_check_syntax_unknown_module_is_reported_as_warning():
+    is_valid, msg = await server.check_scad_syntax("foo_unknown_module();")
+    assert is_valid is True
+    assert "WARNING" in msg
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["cube([1,2,3;", 'assert(false, "boom"); cube(1);'])
+async def test_check_syntax_detects_real_errors(code):
+    is_valid, msg = await server.check_scad_syntax(code)
+    assert is_valid is False
+    assert "ERROR" in msg
+
+
+@pytest.mark.asyncio
+async def test_check_syntax_nonzero_exit_without_error_line_is_invalid(monkeypatch):
+    fake_exec, _ = _fake_openscad_process(139, b"Segmentation fault")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    is_valid, msg = await server.check_scad_syntax("cube(1);")
+    assert is_valid is False
+    assert "139" in msg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — B2: reforço (gusset) do suporte em L fica dentro da peça
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_bracket_gusset_stays_inside_the_part():
+    scad = server.generate_bracket_scad({"type": "L", "width": 40, "height": 40, "depth": 20})
+    out_path, _ = await server.run_openscad(scad, "stl")
+    try:
+        _, (y_min, y_max), (z_min, z_max) = _stl_bbox(out_path)
+    finally:
+        os.remove(out_path)
+    assert y_max - y_min <= 20 + 1e-6      # profundidade (dep): o reforço não pode sair pra fora
+    assert z_max - z_min == pytest.approx(40)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — B13/B14: event loop livre e cancelamento mata o openscad
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool, extra", [("analyze_mesh", {}), ("mesh_section", {"z": 5.0})])
+async def test_mesh_tools_run_off_the_event_loop_thread(tmp_path, monkeypatch, tool, extra):
+    p = tmp_path / "cube.stl"
+    _write_binary_stl(str(p), _box_triangles(size=(10, 10, 10)))
+    real = getattr(server, tool)
+    seen = {}
+
+    def spy(*args, **kwargs):
+        seen["thread"] = threading.current_thread()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(server, tool, spy)
+    await server.handle_call_tool(tool, {"stl_path": str(p), **extra})
+    assert seen["thread"] is not threading.main_thread()
+
+
+def _hanging_openscad(partial_output=None):
+    """Processo falso que fica pendurado em communicate(). Se `partial_output` for dado, grava
+    esses bytes no arquivo de saída (-o) antes de pendurar, como um openscad no meio do trabalho."""
+    started = asyncio.Event()
+    created = {}
+    proc = MagicMock()
+    proc.returncode = None
+    proc.kill = MagicMock()
+
+    async def hang():
+        started.set()
+        await asyncio.sleep(100)
+        return b"", b""
+
+    proc.communicate = hang
+
+    async def fake_exec(*cmd, **kwargs):
+        out_path = cmd[list(cmd).index("-o") + 1]
+        created["out_path"] = out_path
+        if partial_output is not None:
+            with open(out_path, "wb") as f:
+                f.write(partial_output)
+        return proc
+
+    return fake_exec, proc, started, created
+
+
+async def _cancel_after_start(coro, started):
+    task = asyncio.create_task(coro)
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_run_openscad_kills_process_when_cancelled(monkeypatch):
+    fake_exec, proc, started, _ = _hanging_openscad()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await _cancel_after_start(server.run_openscad("cube(1);", "stl"), started)
+    proc.kill.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_openscad_removes_partial_output_when_cancelled(monkeypatch):
+    fake_exec, proc, started, created = _hanging_openscad(partial_output=b"partial stl")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await _cancel_after_start(server.run_openscad("cube(1);", "stl"), started)
+    assert not os.path.exists(created["out_path"])
+
+
+@pytest.mark.asyncio
+async def test_check_syntax_kills_process_when_cancelled(monkeypatch):
+    fake_exec, proc, started, _ = _hanging_openscad()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await _cancel_after_start(server.check_scad_syntax("cube(1);"), started)
+    proc.kill.assert_called_once()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — export_obj (OpenSCAD nightly)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_export_obj_exports_with_openscad_nightly(tmp_path):
+    out = tmp_path / "cube.obj"
+    result = await server.handle_call_tool("export_obj", {
+        "scad_code": "cube([10, 10, 10]);", "output_path": str(out),
+    })
+    if "OBJ requer OpenSCAD 2022+" in result[0].text:
+        pytest.skip("OpenSCAD instalado não exporta OBJ (2021.01)")
+    assert "Exported successfully" in result[0].text
+    lines = out.read_text().splitlines()
+    assert len([ln for ln in lines if ln.startswith("v ")]) == 8      # 8 vértices do cubo
+    assert any(ln.startswith("f ") for ln in lines)
+
+
+@pytest.mark.asyncio
+async def test_export_obj_explains_when_openscad_is_too_old(tmp_path, monkeypatch):
+    async def old_openscad(scad_code, ext, export_args=None, timeout_s=60.0):
+        raise RuntimeError(
+            "OpenSCAD Error:\nEither add a valid suffix or specify one using the --export-format option."
+        )
+
+    monkeypatch.setattr(server, "run_openscad", old_openscad)
+    result = await server.handle_call_tool("export_obj", {
+        "scad_code": "cube(1);", "output_path": str(tmp_path / "cube.obj"),
+    })
+    assert "OBJ requer OpenSCAD 2022+ (nightly)" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_export_obj_passes_other_errors_through(tmp_path, monkeypatch):
+    async def broken(scad_code, ext, export_args=None, timeout_s=60.0):
+        raise RuntimeError("OpenSCAD Error:\nsomething else")
+
+    monkeypatch.setattr(server, "run_openscad", broken)
+    result = await server.handle_call_tool("export_obj", {
+        "scad_code": "cube(1);", "output_path": str(tmp_path / "cube.obj"),
+    })
+    assert "something else" in result[0].text
+    assert "2022+" not in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_export_obj_tool_schema():
+    tools = await server.handle_list_tools()
+    tool = next(t for t in tools if t.name == "export_obj")
+    assert tool.inputSchema["required"] == ["scad_code", "output_path"]
+    assert {"variables", "scad_code", "output_path", "timeout_s"} <= set(tool.inputSchema["properties"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.0 — arquivos de texto sempre em UTF-8, independente do locale
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_text_files_are_utf8_regardless_of_locale(tmp_path):
+    """Sem encoding explícito o Python usa o locale: em locale C (ASCII) escrever '—' ou 'ç' quebrava."""
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    script = (
+        "import asyncio, sys\n"
+        f"sys.path.insert(0, {root!r})\n"
+        "import server\n"
+        "async def go():\n"
+        "    ok, msg = await server.check_scad_syntax('// \\u2014 \\u00e7\\ncube(1);')\n"
+        "    assert ok, msg\n"
+        "    await server.handle_call_tool('generate_assembly', "
+        "{'config': {}, 'output_dir': sys.argv[1], 'project_name': 'asm'})\n"
+        "asyncio.run(go())\n"
+    )
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C", "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0"}
+    proc = subprocess.run(
+        [sys.executable, "-X", "utf8=0", "-c", script, str(tmp_path / "asm")],
+        env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    assert (tmp_path / "asm" / "asm.scad").read_bytes().decode("utf-8")
+    assert "—".encode("utf-8") in (tmp_path / "asm" / "asm_bom.md").read_bytes()
